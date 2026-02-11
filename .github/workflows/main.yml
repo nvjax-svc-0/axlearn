@@ -13,6 +13,10 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
+      - name: refresh workflow
+        run: gh auth refresh -s workflow
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
       - name: Sync Fork via GitHub API
         run: gh repo sync nvjax-svc-0/axlearn -b main
         env:
