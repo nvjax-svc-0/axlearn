@@ -14,7 +14,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
       - name: refresh workflow
-        run: gh auth refresh -s workflow
+        run: gh auth refresh -s workflow --hostname
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
       - name: Sync Fork via GitHub API
