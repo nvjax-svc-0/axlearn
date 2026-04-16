@@ -65,7 +65,6 @@ import enum
 import json
 import os
 import time
-from itertools import chain
 from typing import Optional, cast
 
 import kubernetes as k8s
@@ -119,94 +118,69 @@ def _infer_reservation(jobset_spec: dict) -> Optional[str]:
     return None
 
 
-def _topology_assignment_from_jobset(jobset: dict) -> Optional[list[list[str]]]:
-    """Extracts all topology assignments from jobset, flattened across all jobs.
+def _slice_selection_annotation_from_resource(resource: dict) -> Optional[str]:
+    """Extracts the raw slice-selection annotation string from a k8s resource.
 
-    This function extracts and flattens all assignments across all replicated jobs.
+    This annotation is present on both JobSet and LeaderWorkerSet resources when
+    TPU slice auto-provisioning is configured.
 
     Args:
-        jobset: The JobSet dict.
+        resource: The k8s resource dict (e.g. a JobSet or LeaderWorkerSet response).
 
     Returns:
-        A flattened list of all topology assignments across all jobs, or None if not found.
-        For example, if the annotation contains:
-        {"job1": [["sb-1", "sb-2"], ["sb-3"]], "job2": [["sb-4"]]}
-        This returns: [["sb-1", "sb-2"], ["sb-3"], ["sb-4"]]
+        The raw annotation string, or None if not present.
     """
-    topology_assignments_str = (
-        jobset.get("metadata", {})
+    return (
+        resource.get("metadata", {})
         .get("annotations", {})
         .get("tpu-provisioner.cloud.google.com/slice-selection")
     )
-    if not topology_assignments_str:
-        return None
-
-    try:
-        topology_dict: dict[str, list[list[str]]] = json.loads(topology_assignments_str)
-    except json.JSONDecodeError as e:
-        logging.warning(
-            "Failed to parse topology assignments from annotations %s. error: %s",
-            topology_assignments_str,
-            e,
-        )
-        return None
-
-    # Flatten all assignments across all jobs
-    all_assignments: list[list[str]] = []
-    for job_assignments in topology_dict.values():
-        all_assignments.extend(job_assignments)
-
-    return all_assignments
 
 
-def _topology_assignment_from_env() -> Optional[list[list[str]]]:
-    topology_assignments_env = os.environ.get("BASTION_JOB_TOPOLOGY_ASSIGNMENT")
-    if not topology_assignments_env:
-        logging.debug("No %s environment variable set.", "BASTION_JOB_TOPOLOGY_ASSIGNMENT")
-        return None
-
-    try:
-        return json.loads(topology_assignments_env)
-    except json.JSONDecodeError as e:
-        logging.warning(
-            "Failed to parse topology assignments from env var "
-            "BASTION_JOB_TOPOLOGY_ASSIGNMENT %s. error: %s",
-            topology_assignments_env,
-            e,
-        )
-        return None
-
-
-def _compare_topology_assignments(
-    env_assignments: Optional[list[list[str]]], jobset_assignments: Optional[list[list[str]]]
+def _compare_slice_selection(
+    expected_annotation: Optional[str], deployed_annotation: Optional[str]
 ) -> bool:
-    """Compares topology assignments from env and jobset.
+    """Compares expected and deployed slice-selection annotations.
 
-    Ensures they contain the same subblocks.
+    Both None means no topology is configured, which is considered equal.
+    Otherwise parses both as JSON dicts of the form ``{key: [[subblock, ...], ...]}``,
+    and checks equivalence order-insensitively:
+      - Both dicts must have the same set of keys.
+      - For each key, both must contain the same set of slices (outer list order ignored).
+      - Each slice is treated as a set of subblock strings (inner list order ignored).
 
     Args:
-        env_assignments: Topology assignments from environment variable.
-        jobset_assignments: Topology assignments from jobset annotation (flattened across jobs).
+        expected_annotation: The JSON string from the builder's get_workload_annotations().
+        deployed_annotation: The JSON string from the deployed k8s resource annotation.
 
     Returns:
-        True if both assignments contain the same set of subblocks, False otherwise.
-    """
-    # If both are None, consider them equal
-    if env_assignments is None and jobset_assignments is None:
-        return True
+        True if both annotations are equivalent (or both are None), False otherwise.
 
-    # If one is None and the other isn't, they don't match
-    if env_assignments is None or jobset_assignments is None:
+    Raises:
+        ValueError: If either annotation string is not valid JSON.
+    """
+    if expected_annotation is None and deployed_annotation is None:
+        return True
+    if expected_annotation is None or deployed_annotation is None:
         return False
 
-    # Flatten and extract all subblock IDs from env assignments
-    env_subblocks = set(chain(*env_assignments))
+    try:
+        expected = json.loads(expected_annotation)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse expected slice-selection annotation: {e!r}") from e
 
-    # Flatten and extract all subblock IDs from jobset assignments
-    jobset_subblocks = set(chain(*jobset_assignments))
+    try:
+        deployed = json.loads(deployed_annotation)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse deployed slice-selection annotation: {e!r}") from e
 
-    # Compare as sets (order and grouping don't matter)
-    return env_subblocks == jobset_subblocks
+    if expected.keys() != deployed.keys():
+        return False
+
+    def _normalize(slices: list) -> frozenset:
+        return frozenset(frozenset(subblocks) for subblocks in slices)
+
+    return all(_normalize(expected[k]) == _normalize(deployed[k]) for k in expected)
 
 
 def _infer_processor_type(jobset_spec: dict) -> Optional[str]:
@@ -235,6 +209,34 @@ def _infer_processor_type(jobset_spec: dict) -> Optional[str]:
             return "cpu"
     except (TypeError, KeyError):
         logging.warning("Failed to infer processor type.")
+    return None
+
+
+def _infer_reservation_from_lws(lws_spec: dict) -> Optional[str]:
+    """Infers reservation given a LeaderWorkerSet spec."""
+    try:
+        node_selector = lws_spec["leaderWorkerTemplate"]["workerTemplate"]["spec"]["nodeSelector"]
+        reservation = node_selector.get("cloud.google.com/reservation-name", None)
+        logging.info("Inferred reservation from LWS spec: %s", reservation)
+        return reservation
+    except (TypeError, KeyError):
+        logging.warning("Failed to infer reservation from LWS spec.")
+    return None
+
+
+def _infer_processor_type_from_lws(lws_spec: dict) -> Optional[str]:
+    """Infers processor type (tpu, cpu) given a LeaderWorkerSet spec."""
+    try:
+        node_selector = lws_spec["leaderWorkerTemplate"]["workerTemplate"]["spec"]["nodeSelector"]
+        if node_selector.get("cloud.google.com/gke-tpu-accelerator") is not None:
+            logging.info("Inferred processor type from LWS spec: tpu")
+            return "tpu"
+        if node_selector.get("axlearn/nodepool_type") == "workload":
+            logging.info("Inferred processor type from LWS spec: cpu")
+            return "cpu"
+    except (TypeError, KeyError):
+        logging.warning("Failed to infer processor type from LWS spec.")
+    logging.info("Inferred processor type from LWS spec: None")
     return None
 
 
@@ -344,6 +346,7 @@ class GKERunnerJob(BaseRunnerJob):
         cfg.event_publisher = event_queue_from_config(flag_values=fv)
         if is_vertexai_tensorboard_configured(fv):
             cfg.vertexai_tb_uploader = VertexAITensorboardUploader.from_flags(fv)
+
         return cfg
 
     def __init__(self, cfg: Config, *, bundler: Bundler):
@@ -417,16 +420,17 @@ class GKERunnerJob(BaseRunnerJob):
             if runner_utils.should_recreate_job(tier, reservation, processor_type=processor_type):
                 return GKERunnerJob.Status.RESCHEDULED
 
-            # Validate topology assignments match between env and jobset
-            topology_assignment_env = _topology_assignment_from_env()
-            topology_assignment_jobset = _topology_assignment_from_jobset(jobset=resp)
-            if not _compare_topology_assignments(
-                topology_assignment_env, topology_assignment_jobset
-            ):
+            # Validate topology assignments match between builder config and deployed resource.
+            # If the builder expects a slice-selection annotation, check it matches the resource.
+            expected_slice_selection = self._inner.get_workload_annotations().get(
+                "tpu-provisioner.cloud.google.com/slice-selection"
+            )
+            deployed_slice_selection = _slice_selection_annotation_from_resource(resource=resp)
+            if not _compare_slice_selection(expected_slice_selection, deployed_slice_selection):
                 logging.info(
-                    "Topology assignment changed. Env subblocks: %s, Jobset subblocks: %s",
-                    topology_assignment_env,
-                    topology_assignment_jobset,
+                    "Topology assignment changed. Expected: %s, Deployed: %s",
+                    expected_slice_selection,
+                    deployed_slice_selection,
                 )
                 return GKERunnerJob.Status.RESCHEDULED
 
@@ -604,6 +608,9 @@ class GKERunnerJob(BaseRunnerJob):
         # Track when the job enters SUSPENDED state.
         suspended_since = None
 
+        # Track when resource provisioning starts.
+        provisioning_start = None
+
         while True:
             status = self._get_status()
 
@@ -648,6 +655,7 @@ class GKERunnerJob(BaseRunnerJob):
                     return
 
                 # Provision node pools for the job to run.
+                provisioning_start = time.perf_counter()
                 if self._pre_provisioner is not None:
                     self._pre_provisioner.create_for(self._inner)
 
@@ -677,9 +685,17 @@ class GKERunnerJob(BaseRunnerJob):
                     # Record the time to reach RUNNING state.
                     elapsed_time = time.perf_counter() - start_time
                     metrics.record_job_time_to_running(elapsed_time)
-                    metrics.record_job_run_latency(cfg.name, elapsed_time)
+                    if provisioning_start is not None:
+                        metrics.record_job_provisioning_resources_latency(
+                            time.perf_counter() - provisioning_start
+                        )
                     self._maybe_publish(
                         cfg.name, msg="Job is running", state=JobLifecycleState.RUNNING
+                    )
+                    last_job_status = status
+                elif status == GKERunnerJob.Status.PENDING and status != last_job_status:
+                    self._maybe_publish(
+                        cfg.name, msg="Job is starting", state=JobLifecycleState.STARTING
                     )
                     last_job_status = status
             time.sleep(cfg.status_interval_seconds)
@@ -938,6 +954,7 @@ class LWSRunnerJob(BaseRunnerJob):
         PROGRESSING = "PROGRESSING"
         RUNNING = "RUNNING"
         NOT_STARTED = "NOT_STARTED"
+        RESCHEDULED = "RESCHEDULED"
 
     def _get_status(self) -> Status:
         """Retrieves the current status of the job.
@@ -961,6 +978,26 @@ class LWSRunnerJob(BaseRunnerJob):
                 version="v1",
                 plural="leaderworkersets",
             )
+
+            tier = os.environ.get("BASTION_TIER", 0)
+            reservation = _infer_reservation_from_lws(resp["spec"])
+            processor_type = _infer_processor_type_from_lws(resp["spec"])
+            if runner_utils.should_recreate_job(tier, reservation, processor_type=processor_type):
+                return LWSRunnerJob.Status.RESCHEDULED
+
+            # Validate topology assignments match between builder config and deployed resource.
+            # If the builder expects a slice-selection annotation, check it matches the resource.
+            expected_slice_selection = self._inner.get_workload_annotations().get(
+                "tpu-provisioner.cloud.google.com/slice-selection"
+            )
+            deployed_slice_selection = _slice_selection_annotation_from_resource(resource=resp)
+            if not _compare_slice_selection(expected_slice_selection, deployed_slice_selection):
+                logging.info(
+                    "Topology assignment changed. Env subblocks: %s, LWS subblocks: %s",
+                    expected_slice_selection,
+                    deployed_slice_selection,
+                )
+                return LWSRunnerJob.Status.RESCHEDULED
 
             status = resp.get("status", {})
             conditions = status.get("conditions", [])
@@ -1010,6 +1047,82 @@ class LWSRunnerJob(BaseRunnerJob):
         if self._pre_provisioner is not None:
             self._pre_provisioner.delete_for(self._inner)
 
+    def _reschedule(self):
+        """Reschedules the LWS onto the appropriate tier.
+
+        Mirrors GKERunnerJob._reschedule(): deletes the LWS first, then identifies and
+        deletes any node pools with mismatched tier configuration.
+        """
+        cfg: LWSRunnerJob.Config = self.config
+        logging.info("Deleting LeaderWorkerSet %s", cfg.name)
+        self._inner._delete()  # pylint: disable=protected-access
+
+        node_pool_label_key = "provisioner-nodepool-id"
+        if self._pre_provisioner is not None:
+            node_pool_label_key = PRE_PROVISIONER_LABEL
+        logging.info("Looking up node pools with label key: %s", node_pool_label_key)
+
+        node_pools_dict = list_node_pools_by_label_key(
+            project=cfg.project, zone=cfg.zone, cluster=cfg.cluster, label_key=node_pool_label_key
+        )
+        node_pools = node_pools_dict.get(cfg.name, [])
+        logging.info("Found %d node pool(s) for %s", len(node_pools), cfg.name)
+        if len(node_pools) == 0:
+            logging.info("Could not infer node pool, skipping delete.")
+            return
+        node_pools_to_delete = []
+        for node_pool in node_pools:
+            node_pool_config = node_pool.get("config", {})
+            reservation_affinity = node_pool_config.get("reservationAffinity", {})
+            taints = node_pool_config.get("taints", [])
+            tier = os.environ.get("BASTION_TIER", 0)
+            has_reservation = (
+                reservation_affinity.get("key") == "compute.googleapis.com/reservation-name"
+                and len(reservation_affinity.get("values", [])) > 0
+            )
+            has_spot = any(
+                taint.get("key") == "cloud.google.com/gke-spot"
+                and taint.get("value") == "true"
+                and taint.get("effect") == "NO_SCHEDULE"
+                for taint in taints
+            )
+            logging.info(
+                "Found existing node pool %s with tier %s.\n"
+                "The reservation affinity is: %s\n"
+                "The taints are: %s\n"
+                "has_reservation=%s, has_spot=%s",
+                node_pool["name"],
+                tier,
+                reservation_affinity,
+                taints,
+                has_reservation,
+                has_spot,
+            )
+            if (str(tier) == "0" and not has_reservation) or (str(tier) != "0" and not has_spot):
+                logging.info(
+                    "Since there is a mismatch, we will attempt to delete %s.",
+                    node_pool["name"],
+                )
+                node_pools_to_delete.append(node_pool["name"])
+            else:
+                logging.info("Node pool appears to have the right specs.")
+        if len(node_pools_to_delete) > 0:
+            start_time = time.perf_counter()
+            delete_node_pools(
+                node_pools_to_delete,
+                project=cfg.project,
+                zone=cfg.zone,
+                cluster=cfg.cluster,
+                retry_interval=cfg.retry_interval,
+                wait_timeout=30 * 60 * len(node_pools_to_delete),
+            )
+            elapsed_time = time.perf_counter() - start_time
+            logging.info(
+                "Node pools %s deletion took %s seconds", node_pools_to_delete, elapsed_time
+            )
+        else:
+            logging.info("No node pools require deletion.")
+
     def _execute(self):
         cfg: LWSRunnerJob.Config = self.config
 
@@ -1029,6 +1142,9 @@ class LWSRunnerJob(BaseRunnerJob):
                 logging.info("Task %s exited with status: %s.", cfg.name, status)
                 return
 
+            elif status == LWSRunnerJob.Status.RESCHEDULED:
+                logging.info("LWS configuration changed. Rescheduling the LeaderWorkerSet...")
+                self._reschedule()
             elif status == LWSRunnerJob.Status.NOT_STARTED:
                 logging.info("Task has not started. Starting it now...")
                 # pylint: disable-next=protected-access
@@ -1052,9 +1168,14 @@ class LWSRunnerJob(BaseRunnerJob):
                     self._tb_uploader.upload()
                 logging.info("Task %s has status: %s", cfg.name, status)
                 # Only emit events when status changes.
-                if status == LWSRunnerJob.Status.RUNNING and status != last_job_status:
+                if (
+                    status in (LWSRunnerJob.Status.RUNNING, LWSRunnerJob.Status.PROGRESSING)
+                    and status != last_job_status
+                ):
                     self._maybe_publish(
-                        cfg.name, msg="LeaderWorkerSet is running", state=JobLifecycleState.RUNNING
+                        cfg.name,
+                        msg=f"LeaderWorkerSet is {status.name.lower()}",
+                        state=JobLifecycleState.RUNNING,
                     )
                     last_job_status = status
             time.sleep(cfg.status_interval_seconds)

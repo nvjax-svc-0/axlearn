@@ -36,6 +36,16 @@ DEFAULT_MANAGER_PORT = 8901
 # Client timeout in seconds
 DEFAULT_CLIENT_TIMEOUT = 10.0
 
+# Sentinel value indicating tensorcore utilization is unavailable.
+TENSORCORE_UTIL_UNAVAILABLE = -1.0
+
+# Straggler detection log labels
+STRAGGLER_CONFIRMED = "Straggler worker confirmed"
+STRAGGLER_POTENTIAL = "Potential straggler worker"
+
+# How often the monitor reports status to the FT manager (seconds).
+REPORT_INTERVAL_SECONDS = 30
+
 # Compiled regex patterns for hostname parsing
 _WORKER_ID_PATTERN = re.compile(r"^.+?-job-\d+-(\d+)\..+")
 _JOB_NAME_PATTERN = re.compile(r"^(.+?)-job-\d+-\d+\.(\1)(?:\.|$)")
@@ -200,7 +210,8 @@ def retry(max_attempts: int = 3, retry_interval: float = 1.0):
 
     Args:
         max_attempts: Maximum number of retry attempts
-        retry_interval: Initial retry interval in seconds
+        retry_interval: Initial retry interval in seconds; doubles on each subsequent attempt,
+            capped at 60 seconds
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
@@ -214,7 +225,7 @@ def retry(max_attempts: int = 3, retry_interval: float = 1.0):
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     if attempt == max_attempts - 1:  # Last attempt
                         raise e
-                    time.sleep(retry_interval)  # Simple delay between retries
+                    time.sleep(min(retry_interval * (2**attempt), 60))  # Exponential backoff
 
         return wrapper
 

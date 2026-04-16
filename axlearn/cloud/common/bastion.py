@@ -98,7 +98,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import suppress
 from datetime import datetime, timezone
 from subprocess import CalledProcessError
-from typing import IO, Any, NamedTuple, Optional, Union
+from typing import IO, Any, Dict, NamedTuple, Optional, Union
 
 from absl import flags, logging
 from tensorflow import nest as tf_nest
@@ -115,7 +115,13 @@ from axlearn.cloud.common.cleaner import Cleaner
 from axlearn.cloud.common.event_queue import BaseQueueClient, Event
 from axlearn.cloud.common.quota import QuotaFn
 from axlearn.cloud.common.scheduler import BaseScheduler, JobScheduler, ResourceMap
-from axlearn.cloud.common.types import JobMetadata, JobSpec, JobStateMetadata, Topology
+from axlearn.cloud.common.types import (
+    JobMetadata,
+    JobSpec,
+    JobStateMetadata,
+    ResourceType,
+    Topology,
+)
 from axlearn.cloud.common.uploader import Uploader
 from axlearn.cloud.common.utils import merge, send_signal
 from axlearn.cloud.common.validator import JobValidator
@@ -143,6 +149,9 @@ FLAGS = flags.FLAGS
 
 _VALID_NAME_CHARS = r"[!-~]+"  # match all printing ASCII characters except space
 valid_name_re = re.compile(_VALID_NAME_CHARS)
+
+
+_JOB_METADATA_FIELD_NAMES = {f.name for f in dataclasses.fields(JobMetadata)}
 
 
 def bastion_job_flags(flag_values: flags.FlagValues = FLAGS):
@@ -317,6 +326,7 @@ def new_jobspec(
     cleanup_command: Optional[str] = None,
     env_vars: Optional[dict[str, str]] = None,
     version: int = _LATEST_BASTION_VERSION,
+    code_asset_path: Optional[str] = None,
 ) -> JobSpec:
     """Constructs a JobSpec with basic schema validation."""
     jobspec = JobSpec(
@@ -326,6 +336,7 @@ def new_jobspec(
         cleanup_command=cleanup_command,
         env_vars=env_vars,
         metadata=metadata,
+        code_asset_path=code_asset_path,
     )
     _validate_jobspec(jobspec)
     return jobspec
@@ -344,9 +355,12 @@ def serialize_jobspec(spec: JobSpec, f: Union[str, IO]):
         "%Y-%m-%d %H:%M:%S.%f"
     )
 
-    # For backwards compatibility, only include topologies if they are set
+    # For backwards compatibility, only include optional fields if they are set
     if not data["metadata"]["topologies"]:
         del data["metadata"]["topologies"]
+
+    if not data["code_asset_path"]:
+        del data["code_asset_path"]
 
     json.dump(data, f, default=str)
     f.flush()
@@ -367,13 +381,25 @@ def deserialize_jobspec(f: Union[str, IO]) -> JobSpec:
             data["metadata"]["topologies"] = [
                 Topology(**topology) for topology in data["metadata"]["topologies"]
             ]
+        # Backwards compatible: only pass fields that JobMetadata currently supports.
+        skipped = data["metadata"].keys() - _JOB_METADATA_FIELD_NAMES
+        if skipped:
+            logging.info(
+                "deserialize_jobspec: job %s skipping unknown metadata fields: %s",
+                data["name"],
+                skipped,
+            )
+        metadata_kwargs = {
+            k: v for k, v in data["metadata"].items() if k in _JOB_METADATA_FIELD_NAMES
+        }
         return new_jobspec(
             version=data["version"],
             name=data["name"],
             command=data["command"],
             cleanup_command=data.get("cleanup_command", None),
             env_vars=data.get("env_vars", None),
-            metadata=JobMetadata(**data["metadata"]),
+            metadata=JobMetadata(**metadata_kwargs),
+            code_asset_path=data.get("code_asset_path", None),
         )
     raise ValidationError(f"Unsupported version: {data["version"]}")
 
@@ -737,6 +763,68 @@ def set_runtime_options(bastion_dir: str, **kwargs) -> Nested[Any]:
     return runtime_options
 
 
+@dataclasses.dataclass
+class ProjectResourceUtilization:
+    """Holds per-resource-type usage and quota for a project.
+
+    Attributes:
+        usage: Current resource usage for this resource type.
+        quota: Resource quota for this resource type.
+    """
+
+    usage: int
+    quota: int
+
+
+def get_project_utilization(
+    project: str,
+    schedule_results: BaseScheduler.ScheduleResults,
+    project_quota: ResourceMap,
+) -> dict[ResourceType, ProjectResourceUtilization]:
+    """Returns per-resource utilization for the given project.
+
+    Args:
+        project: The project ID to look up.
+        schedule_results: The results from a scheduler run, used to obtain current resource usages.
+        project_quota: The assigned quota for the project, used as the resource quota. This should
+            come from the bastion's quota function (e.g. QuotaInfo.project_resources[project]).
+
+    Returns:
+        A mapping from resource type to ProjectResourceUtilization. Returns an empty dict if the
+        project is not present in schedule_results and has no quota entries.
+    """
+    usages = schedule_results.project_usages.get(project, {})
+    quotas = project_quota
+    resource_types = set(usages) | set(quotas)
+    return {
+        resource_type: ProjectResourceUtilization(
+            usage=usages.get(resource_type, 0),
+            quota=quotas.get(resource_type, 0),
+        )
+        for resource_type in resource_types
+    }
+
+
+def format_project_utilization(
+    utilization: dict[ResourceType, ProjectResourceUtilization],
+) -> str:
+    """Returns a human-readable per-resource utilization string.
+
+    Args:
+        utilization: Mapping from resource type to ProjectResourceUtilization.
+
+    Returns:
+        A string like 'v4: 42/100 (42.0%), v3: 2/10 (20.0%)'. Returns an empty string if the
+        utilization mapping is empty.
+    """
+    parts = []
+    for resource_type in sorted(utilization):
+        entry = utilization[resource_type]
+        pct = 100.0 * entry.usage / entry.quota if entry.quota > 0 else 0.0
+        parts.append(f"{resource_type}: {entry.usage}/{entry.quota} ({pct:.1f}%)")
+    return ", ".join(parts)
+
+
 class Bastion(Configurable):
     """An orchestrator that schedules and executes jobs."""
 
@@ -805,6 +893,42 @@ class Bastion(Configurable):
         self._uploader = cfg.uploader.set(src_dir=_LOG_DIR, dst_dir=self._log_dir).instantiate()
         self._event_publisher = maybe_instantiate(cfg.event_publisher)
         self._validator = cfg.validator.instantiate() if cfg.validator else None
+
+    def _build_preemption_message(
+        self,
+        job: "Job",
+        schedule_results: Optional[BaseScheduler.ScheduleResults],
+    ) -> str:
+        """Builds the preemption history message for a job.
+
+        Args:
+            job: The job being preempted.
+            schedule_results: Optional scheduler results used to look up project utilization.
+
+        Returns:
+            A message string, e.g.:
+                "PENDING: pre-empting (project utilization: v4: 38/100 (38.0%))"
+        """
+        base = "PENDING: pre-empting"
+        if schedule_results is None:
+            return base
+        project_id = job.spec.metadata.project_id
+        project_quota = self._quota().project_resources.get(project_id, {})
+        utilization = get_project_utilization(project_id, schedule_results, project_quota)
+        if not utilization:
+            return base
+        # Add the preempted job's own resources back to each utilization entry so that the
+        # displayed usage reflects the cluster state at the time of preemption rather than
+        # the post-preemption state reported by the scheduler.
+        job_resources: ResourceMap = job.spec.metadata.resources
+        adjusted_utilization = {}
+        for resource_type, entry in utilization.items():
+            job_demand = job_resources.get(resource_type, 0)
+            adjusted_utilization[resource_type] = ProjectResourceUtilization(
+                usage=entry.usage + job_demand,
+                quota=entry.quota,
+            )
+        return f"{base} (project utilization: {format_project_utilization(adjusted_utilization)})"
 
     def _append_to_job_history(self, job: Job, *, msg: str, state: JobLifecycleState):
         with fs_open(os.path.join(self._job_history_dir, f"{job.spec.name}"), "a") as f:
@@ -1033,7 +1157,12 @@ class Bastion(Configurable):
                 curr_job.spec, curr_job.state = updated_job.spec, updated_job.state
 
     # pylint: disable-next=too-many-statements
-    def _update_single_job(self, job: Job) -> Job:
+    def _update_single_job(
+        self,
+        job: Job,
+        *,
+        schedule_results: Optional[BaseScheduler.ScheduleResults] = None,
+    ) -> Job:
         """Handles all state transitions for a single job.
 
         Assumptions:
@@ -1048,6 +1177,11 @@ class Bastion(Configurable):
         Conditions that must be held at exit (either pre-emption or graceful):
         1. A jobspec must still exist in the remote job dir.
         2. self._active_jobs must be unmodified, besides modifying `job` itself.
+
+        Args:
+            job: The job to update.
+            schedule_results: Optional scheduler results used to enrich preemption history messages
+                with per-resource-type utilization for the job's project.
         """
         if job.state.status == JobStatus.PENDING:
             # Forcefully terminate the command proc and fd, if they exist, and sync logs to remote.
@@ -1059,10 +1193,13 @@ class Bastion(Configurable):
             # 2. Any job logs are sync'ed to remote log dir. The local log file cannot reliably be
             #    expected to be present if/when the job is resumed.
             if job.command_proc is not None:
+                preemption_msg = self._build_preemption_message(job, schedule_results)
                 self._append_to_job_history(
-                    job, msg="PENDING: pre-empting", state=JobLifecycleState.PREEMPTING
+                    job,
+                    msg=preemption_msg,
+                    state=JobLifecycleState.PREEMPTING,
                 )
-                logging.info("Pre-empting job: %s", job.spec.name)
+                logging.info("Pre-empting job: %s (%s)", job.spec.name, preemption_msg)
                 self._wait_and_close_proc(job.command_proc, kill=True)
                 job.command_proc = None
                 logging.info("Job is pre-empted: %s", job.spec.name)
@@ -1298,7 +1435,7 @@ class Bastion(Configurable):
         # TODO(markblee): Parallelize this.
         for job_name, job in self._active_jobs.items():
             try:
-                self._update_single_job(job)
+                self._update_single_job(job, schedule_results=schedule_results)
             except (CalledProcessError, RuntimeError) as e:
                 logging.warning("Failed to execute %s: %s", job_name, e)
 
@@ -1306,6 +1443,13 @@ class Bastion(Configurable):
         logging.info("All job states:")
         for job_name, job in self._active_jobs.items():
             logging.info("%s: %s", job_name, job.state)
+
+        status_counts = collections.Counter(
+            str(job.state.status) for job in self._active_jobs.values()
+        )
+        counts_by_status: Dict[str, int] = {s.value: 0 for s in JobStatus}
+        counts_by_status.update(status_counts)
+        metrics.record_job_counts_by_status(counts_by_status)
 
         logging.info("==End of update step.")
         logging.info("")
@@ -1373,6 +1517,7 @@ class Bastion(Configurable):
             self._update_jobs()
             self._gc_jobs()
             execute_s = time.time() - start
+            metrics.record_scheduling_latency(execute_s)
             if execute_s > cfg.update_interval_seconds:
                 logging.warning(
                     "Execute step exceeded interval: %s > %s",

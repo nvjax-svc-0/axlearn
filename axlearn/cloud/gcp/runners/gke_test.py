@@ -3,8 +3,9 @@
 """Tests GKERunnerJob."""
 import contextlib
 import dataclasses
+import json
 
-# pylint: disable=no-self-use,protected-access
+# pylint: disable=no-self-use,protected-access,redefined-outer-name
 from collections.abc import Sequence
 from typing import Optional
 from unittest import mock
@@ -17,9 +18,10 @@ from absl.testing import parameterized
 from axlearn.cloud.common.bastion import BASTION_JOB_VERSION_ENV_VAR
 from axlearn.cloud.common.bundler import Bundler
 from axlearn.cloud.common.utils import FlagConfigurable, define_flags, from_flags
-from axlearn.cloud.gcp import bundler, node_pool_provisioner
+from axlearn.cloud.gcp import bundler, job, node_pool_provisioner, topology_utils
 from axlearn.cloud.gcp.job_flink import FlinkJobStatus
 from axlearn.cloud.gcp.jobset_utils import BASTION_JOB_VERSION_LABEL, TPUReplicatedJob
+from axlearn.cloud.gcp.k8s_backend_policy import LWSGCPBackendPolicy
 from axlearn.cloud.gcp.node_pool import PRE_PROVISIONER_LABEL
 from axlearn.cloud.gcp.pathways_utils import PathwaysLeaderWorkerTemplate
 from axlearn.cloud.gcp.runners import gke as runner_gke
@@ -27,12 +29,12 @@ from axlearn.cloud.gcp.runners import named_runner_configs
 from axlearn.cloud.gcp.runners.gke import (
     GKERunnerJob,
     LWSRunnerJob,
+    _compare_slice_selection,
     _infer_job_count,
     _infer_job_version,
     _infer_processor_type,
     _infer_reservation,
-    _topology_assignment_from_env,
-    _topology_assignment_from_jobset,
+    _slice_selection_annotation_from_resource,
 )
 from axlearn.cloud.gcp.test_utils import default_mock_settings, mock_gcp_settings
 from axlearn.common.config import REQUIRED, Required, config_class
@@ -112,6 +114,15 @@ def _build_replicated_job(node_selector: dict[str, str]):
             },
         }
     }
+
+
+def _mock_lws_spec(reservation: Optional[str] = None, is_spot: bool = False):
+    node_selector = {"cloud.google.com/gke-tpu-accelerator": "tpu-v5p-slice"}
+    if reservation:
+        node_selector["cloud.google.com/reservation-name"] = reservation
+    if is_spot:
+        node_selector["cloud.google.com/gke-spot"] = "true"
+    return {"leaderWorkerTemplate": {"workerTemplate": {"spec": {"nodeSelector": node_selector}}}}
 
 
 def _mock_hybrid_replicated_jobs(has_tpu: bool, has_cpu: bool):
@@ -451,110 +462,104 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
         self.assertEqual(expected, _infer_job_version(status))
 
     @parameterized.parameters(
-        # Test case 1: Valid topology assignment with single job
+        # Test case 1: Annotation present
         dict(
-            jobset={
+            resource={
                 "metadata": {
                     "annotations": {
                         "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"job": [["slice1", "slice2"], ["slice3", "slice4"]]}'
+                            '{"job": [["slice1", "slice2"]]}'
                         ),
                     }
                 }
             },
-            expected=[["slice1", "slice2"], ["slice3", "slice4"]],
+            expected='{"job": [["slice1", "slice2"]]}',
         ),
         # Test case 2: Missing annotation
         dict(
-            jobset={"metadata": {"annotations": {}}},
+            resource={"metadata": {"annotations": {}}},
             expected=None,
         ),
-        # Test case 3: Annotation with different key name (tests generic behavior)
+        # Test case 3: No metadata
         dict(
-            jobset={
-                "metadata": {
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"tpu-job-worker": [["slice1", "slice2"]]}'
-                        )
-                    }
-                }
-            },
-            expected=[["slice1", "slice2"]],
-        ),
-        # Test case 4: Multi-job topology assignments (flattened across jobs)
-        dict(
-            jobset={
-                "metadata": {
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"trainer": [["slice1", "slice2"]], "evaluator": [["slice3"]]}'
-                        )
-                    }
-                }
-            },
-            expected=[["slice1", "slice2"], ["slice3"]],
-        ),
-        # Test case 5: Invalid JSON in annotation
-        dict(
-            jobset={
-                "metadata": {
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": "invalid-json"
-                    }
-                }
-            },
+            resource={},
             expected=None,
-        ),
-        # Test case 6: Empty string annotation
-        dict(
-            jobset={
-                "metadata": {
-                    "annotations": {"tpu-provisioner.cloud.google.com/slice-selection": ""}
-                }
-            },
-            expected=None,
-        ),
-        # Test case 7: Single topology assignment
-        dict(
-            jobset={
-                "metadata": {
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": '{"job": [["slice1"]]}'
-                    }
-                }
-            },
-            expected=[["slice1"]],
-        ),
-        # Test case 8: Empty dict in annotation
-        dict(
-            jobset={
-                "metadata": {
-                    "annotations": {"tpu-provisioner.cloud.google.com/slice-selection": "{}"}
-                }
-            },
-            expected=[],
-        ),
-        # Test case 9: Multiple jobs with multiple replicas each
-        dict(
-            jobset={
-                "metadata": {
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"job1": [["sb-1", "sb-2"], ["sb-3", "sb-4"]], '
-                            '"job2": [["sb-5", "sb-6"]]}'
-                        )
-                    }
-                }
-            },
-            expected=[["sb-1", "sb-2"], ["sb-3", "sb-4"], ["sb-5", "sb-6"]],
         ),
     )
-    def test_topology_assignment_from_jobset(
-        self, jobset: dict, expected: Optional[list[list[str]]]
+    def test_slice_selection_annotation_from_resource(
+        self, resource: dict, expected: Optional[str]
     ):
-        """Test _topology_assignment_from_jobset extracts topology assignments correctly."""
-        self.assertEqual(expected, _topology_assignment_from_jobset(jobset))
+        """Test _slice_selection_annotation_from_resource extracts annotation correctly."""
+        self.assertEqual(expected, _slice_selection_annotation_from_resource(resource))
+
+    @parameterized.parameters(
+        # Both None: equal (no topology configured).
+        dict(expected=None, deployed=None, result=True),
+        # Expected set, deployed None: not equal.
+        dict(expected='{"job": [["sb-1"]]}', deployed=None, result=False),
+        # Expected None, deployed set: not equal.
+        dict(expected=None, deployed='{"job": [["sb-1"]]}', result=False),
+        # Exact match.
+        dict(
+            expected='{"job": [["sb-1", "sb-2"]]}',
+            deployed='{"job": [["sb-1", "sb-2"]]}',
+            result=True,
+        ),
+        # Deployed has extra key: different key sets, not equal.
+        dict(
+            expected='{"workers": [["sb-1"]]}',
+            deployed='{"leader": [["sb-2"]], "workers": [["sb-1"]]}',
+            result=False,
+        ),
+        # Value mismatch.
+        dict(
+            expected='{"job": [["sb-1"]]}',
+            deployed='{"job": [["sb-2"]]}',
+            result=False,
+        ),
+        # Subblock order within a slice does not matter.
+        dict(
+            expected='{"job": [["sb-1", "sb-2"]]}',
+            deployed='{"job": [["sb-2", "sb-1"]]}',
+            result=True,
+        ),
+        # Slice order within a key does not matter.
+        dict(
+            expected='{"job": [["sb-1"], ["sb-2"]]}',
+            deployed='{"job": [["sb-2"], ["sb-1"]]}',
+            result=True,
+        ),
+        # Both slice order and subblock order differ, still equal.
+        dict(
+            expected='{"job": [["sb-1", "sb-2"], ["sb-3", "sb-4"]]}',
+            deployed='{"job": [["sb-4", "sb-3"], ["sb-2", "sb-1"]]}',
+            result=True,
+        ),
+        # Multiple keys, all order-insensitive.
+        dict(
+            expected='{"workers": [["sb-1", "sb-2"]], "leader": [["sb-3"]]}',
+            deployed='{"leader": [["sb-3"]], "workers": [["sb-2", "sb-1"]]}',
+            result=True,
+        ),
+    )
+    def test_compare_slice_selection(
+        self, expected: Optional[str], deployed: Optional[str], result: bool
+    ):
+        """Test _compare_slice_selection comparison logic."""
+        self.assertEqual(result, _compare_slice_selection(expected, deployed))
+
+    @parameterized.parameters(
+        # Invalid JSON in expected raises ValueError.
+        dict(expected="not-json", deployed='{"job": [["sb-1"]]}'),
+        # Invalid JSON in deployed raises ValueError.
+        dict(expected='{"job": [["sb-1"]]}', deployed="not-json"),
+    )
+    def test_compare_slice_selection_invalid_json(
+        self, expected: Optional[str], deployed: Optional[str]
+    ):
+        """Test _compare_slice_selection raises ValueError on invalid JSON."""
+        with self.assertRaises(ValueError):
+            _compare_slice_selection(expected, deployed)
 
     @parameterized.parameters(
         # Test case 1: Valid topology assignment from env
@@ -596,13 +601,13 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
     def test_topology_assignment_from_env(
         self, env_var: Optional[str], expected: Optional[list[list[str]]]
     ):
-        """Test _topology_assignment_from_env extracts topology assignments from env correctly."""
+        """Test get_topology_from_env extracts topology assignments from env correctly."""
         env_dict = {}
         if env_var is not None:
             env_dict["BASTION_JOB_TOPOLOGY_ASSIGNMENT"] = env_var
 
         with mock.patch.dict("os.environ", env_dict, clear=False):
-            self.assertEqual(expected, _topology_assignment_from_env())
+            self.assertEqual(expected, topology_utils.get_topology_from_env())
 
     @parameterized.product(
         config=(
@@ -849,7 +854,7 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
                 spec=dict(replicatedJobs=_mock_replicated_jobs(["test-reservation"], 2, 1)),
                 expected=runner_gke.GKERunnerJob.Status.READY,
             ),
-            # Topology assignments match between env and jobset annotation.
+            # Topology assignments match between builder config and jobset annotation.
             GetStatusTestConfig(
                 tier="0",
                 job_version=None,
@@ -869,27 +874,7 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
                 topology_assignment='[["slice1", "slice2"]]',
                 expected=runner_gke.GKERunnerJob.Status.READY,
             ),
-            # Topology assignments match with different key name (tests generic behavior).
-            GetStatusTestConfig(
-                tier="0",
-                job_version=None,
-                status=dict(
-                    replicatedJobsStatus=[
-                        dict(active=1, ready=1),
-                    ],
-                ),
-                spec=dict(replicatedJobs=_mock_replicated_jobs(["test-reservation"], None, 1)),
-                metadata={
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"tpu-worker": [["slice1", "slice2"]]}'
-                        ),
-                    }
-                },
-                topology_assignment='[["slice1", "slice2"]]',
-                expected=runner_gke.GKERunnerJob.Status.READY,
-            ),
-            # Topology assignments do not match between env and jobset annotation.
+            # Topology assignments do not match between builder config and jobset annotation.
             GetStatusTestConfig(
                 tier="0",
                 job_version=None,
@@ -909,7 +894,7 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
                 topology_assignment='[["slice3", "slice4"]]',
                 expected=runner_gke.GKERunnerJob.Status.RESCHEDULED,
             ),
-            # Multi-job topology assignments match.
+            # Topology set in builder but no annotation deployed yet: mismatch -> RESCHEDULED.
             GetStatusTestConfig(
                 tier="0",
                 job_version=None,
@@ -919,54 +904,8 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
                     ],
                 ),
                 spec=dict(replicatedJobs=_mock_replicated_jobs(["test-reservation"], None, 1)),
-                metadata={
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"trainer": [["sb-1", "sb-2"]], "evaluator": [["sb-3"]]}'
-                        ),
-                    }
-                },
-                topology_assignment='[["sb-1", "sb-2"], ["sb-3"]]',
-                expected=runner_gke.GKERunnerJob.Status.READY,
-            ),
-            # Multi-job topology assignments do not match (different subblocks).
-            GetStatusTestConfig(
-                tier="0",
-                job_version=None,
-                status=dict(
-                    replicatedJobsStatus=[
-                        dict(active=1, ready=1),
-                    ],
-                ),
-                spec=dict(replicatedJobs=_mock_replicated_jobs(["test-reservation"], None, 1)),
-                metadata={
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"trainer": [["slice1", "slice2"]], "evaluator": [["slice3"]]}'
-                        ),
-                    }
-                },
-                topology_assignment='[["slice1", "slice2"], ["slice4"]]',
-                expected=runner_gke.GKERunnerJob.Status.RESCHEDULED,
-            ),
-            # Multi-job topology assignments do not match (missing subblock in jobset).
-            GetStatusTestConfig(
-                tier="0",
-                job_version=None,
-                status=dict(
-                    replicatedJobsStatus=[
-                        dict(active=1, ready=1),
-                    ],
-                ),
-                spec=dict(replicatedJobs=_mock_replicated_jobs(["test-reservation"], None, 1)),
-                metadata={
-                    "annotations": {
-                        "tpu-provisioner.cloud.google.com/slice-selection": (
-                            '{"trainer": [["slice1"]], "evaluator": [["slice2"]]}'
-                        ),
-                    }
-                },
-                topology_assignment='[["slice1"], ["slice2"], ["slice3"]]',
+                metadata={"annotations": {}},
+                topology_assignment='[["slice1", "slice2"]]',
                 expected=runner_gke.GKERunnerJob.Status.RESCHEDULED,
             ),
         ),
@@ -984,6 +923,12 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
             enable_pre_provisioner=enable_pre_provisioner,
             num_replicas=config.num_slices,
         )
+
+        # Set topology_assignment in builder config before instantiation.
+        if config.topology_assignment is not None:
+            cfg.inner.builder.topology_assignment = json.loads(config.topology_assignment)
+            cfg.inner.builder.enable_tpu_slice_auto_provisioning = True
+
         job: GKERunnerJob = cfg.instantiate(bundler=mock.create_autospec(Bundler))
 
         if isinstance(config.status, Exception):
@@ -994,8 +939,6 @@ class TPUGKERunnerJobTest(parameterized.TestCase):
             )
 
         env_dict = {"BASTION_TIER": config.tier, BASTION_JOB_VERSION_ENV_VAR: config.job_version}
-        if config.topology_assignment is not None:
-            env_dict["BASTION_JOB_TOPOLOGY_ASSIGNMENT"] = config.topology_assignment
 
         with (
             mock.patch.dict("os.environ", env_dict),
@@ -1634,6 +1577,43 @@ class LWSRunnerJobTest(parameterized.TestCase):
         LWSRunnerJob.set_defaults(fv)
         self.assertIsNotNone(fv["name"].default)
 
+    def test_backend_policy_initialized_in_runner_config(self):
+        """Tests that backend_policy config is initialized in runner.
+
+        This is a regression test for a bug where backend_policy was None,
+        preventing GCPBackendPolicy from being created even when both
+        gke_gateway_route=True and enable_telemetry=True.
+        """
+        # Get the runner config
+        runner_cfg = named_runner_configs("gke_tpu_lws_pathways")
+
+        # Check that inner is GKELeaderWorkerSet
+        self.assertIsInstance(runner_cfg.inner, job.GKELeaderWorkerSet.Config)
+
+        # Check that backend_policy is initialized (not None)
+        self.assertIsNotNone(
+            runner_cfg.inner.backend_policy,
+            "backend_policy must be initialized in gke_tpu_lws_pathways "
+            "runner config. Without this, GCPBackendPolicy will never be "
+            "created even when both gke_gateway_route=True and "
+            "enable_telemetry=True.",
+        )
+
+        # Check that it's the correct type
+        self.assertIsInstance(
+            runner_cfg.inner.backend_policy,
+            LWSGCPBackendPolicy.Config,
+            "backend_policy should be an LWSGCPBackendPolicy.Config",
+        )
+
+        # Check that other gateway-related configs are also initialized
+        self.assertIsNotNone(runner_cfg.inner.service, "service should be initialized")
+        self.assertIsNotNone(runner_cfg.inner.http_route, "http_route should be initialized")
+        self.assertIsNotNone(
+            runner_cfg.inner.health_check_policy,
+            "health_check_policy should be initialized",
+        )
+
     @parameterized.product(
         status=[
             runner_gke.LWSRunnerJob.Status.FAILED,
@@ -1666,6 +1646,8 @@ class LWSRunnerJobTest(parameterized.TestCase):
                 ),
                 spec=None,
                 num_slices=1,
+                metadata={},
+                topology_assignment=None,
                 expected=runner_gke.LWSRunnerJob.Status.PROGRESSING,
             ),
             dict(
@@ -1678,6 +1660,8 @@ class LWSRunnerJobTest(parameterized.TestCase):
                 ),
                 spec=None,
                 num_slices=1,
+                metadata={},
+                topology_assignment=None,
                 expected=runner_gke.LWSRunnerJob.Status.RUNNING,
             ),
             dict(
@@ -1690,11 +1674,106 @@ class LWSRunnerJobTest(parameterized.TestCase):
                 ),
                 spec=None,
                 num_slices=1,
+                metadata={},
+                topology_assignment=None,
                 expected=runner_gke.LWSRunnerJob.Status.UPDATING,
+            ),
+            # Topology assignments match between builder config and LWS annotation.
+            dict(
+                tier=None,
+                job_version=None,
+                status=dict(
+                    conditions=[
+                        dict(type="Available", status="True"),
+                    ]
+                ),
+                spec=None,
+                num_slices=1,
+                metadata={
+                    "annotations": {
+                        "tpu-provisioner.cloud.google.com/slice-selection": (
+                            '{"workers": [["slice1", "slice2"]]}'
+                        ),
+                    }
+                },
+                topology_assignment='[["slice1", "slice2"]]',
+                expected=runner_gke.LWSRunnerJob.Status.RUNNING,
+            ),
+            # Topology assignments do not match between builder config and LWS annotation.
+            dict(
+                tier=None,
+                job_version=None,
+                status=dict(
+                    conditions=[
+                        dict(type="Available", status="True"),
+                    ]
+                ),
+                spec=None,
+                num_slices=1,
+                metadata={
+                    "annotations": {
+                        "tpu-provisioner.cloud.google.com/slice-selection": (
+                            '{"workers": [["slice1", "slice2"]]}'
+                        ),
+                    }
+                },
+                topology_assignment='[["slice3", "slice4"]]',
+                expected=runner_gke.LWSRunnerJob.Status.RESCHEDULED,
+            ),
+            # Deployed annotation has extra "leader" key: strict equality, so RESCHEDULED.
+            dict(
+                tier=None,
+                job_version=None,
+                status=dict(
+                    conditions=[
+                        dict(type="Available", status="True"),
+                    ]
+                ),
+                spec=None,
+                num_slices=1,
+                metadata={
+                    "annotations": {
+                        "tpu-provisioner.cloud.google.com/slice-selection": (
+                            '{"leader": [["sb-1"]], "workers": [["sb-2", "sb-3"]]}'
+                        ),
+                    }
+                },
+                topology_assignment='[["sb-2", "sb-3"]]',
+                expected=runner_gke.LWSRunnerJob.Status.RESCHEDULED,
+            ),
+            # No topology annotation and no config: both None, considered equal.
+            dict(
+                tier=None,
+                job_version=None,
+                status=dict(
+                    conditions=[
+                        dict(type="Available", status="True"),
+                    ]
+                ),
+                spec=None,
+                num_slices=1,
+                metadata={},
+                topology_assignment=None,
+                expected=runner_gke.LWSRunnerJob.Status.RUNNING,
+            ),
+            # Config has topology but no annotation deployed yet: mismatch -> RESCHEDULED.
+            dict(
+                tier=None,
+                job_version=None,
+                status=dict(
+                    conditions=[
+                        dict(type="Available", status="True"),
+                    ]
+                ),
+                spec=None,
+                num_slices=1,
+                metadata={},
+                topology_assignment='[["slice1"]]',
+                expected=runner_gke.LWSRunnerJob.Status.RESCHEDULED,
             ),
         )
     )
-    def test_get_status(
+    def test_get_status(  # pylint: disable=too-many-positional-arguments
         self,
         status: dict,
         num_slices: int,
@@ -1702,6 +1781,8 @@ class LWSRunnerJobTest(parameterized.TestCase):
         tier: str,
         job_version: Optional[int],
         spec: dict,
+        metadata: dict,
+        topology_assignment: Optional[str],
         enable_pre_provisioner: Optional[bool] = None,
     ):
         cfg = self._job_config(
@@ -1711,17 +1792,25 @@ class LWSRunnerJobTest(parameterized.TestCase):
             enable_pre_provisioner=enable_pre_provisioner,
             num_replicas=num_slices,
         )
+
+        # Set topology_assignment in builder's inner TPU config before instantiation.
+        if topology_assignment is not None:
+            cfg.inner.builder.inner.topology_assignment = json.loads(topology_assignment)
+            cfg.inner.builder.inner.enable_tpu_slice_auto_provisioning = True
+
         job: LWSRunnerJob = cfg.instantiate(bundler=mock.create_autospec(Bundler))
 
         if isinstance(status, Exception):
             mock_get_status = mock.Mock(side_effect=status)
         else:
-            mock_get_status = mock.Mock(return_value=dict(status=status, spec=spec))
+            mock_get_status = mock.Mock(
+                return_value=dict(metadata=metadata, status=status, spec=spec)
+            )
+
+        env_dict = {"BASTION_TIER": tier, BASTION_JOB_VERSION_ENV_VAR: job_version}
 
         with (
-            mock.patch.dict(
-                "os.environ", {"BASTION_TIER": tier, BASTION_JOB_VERSION_ENV_VAR: job_version}
-            ),
+            mock.patch.dict("os.environ", env_dict),
             mock.patch(
                 "kubernetes.client.CustomObjectsApi",
                 return_value=mock.Mock(get_namespaced_custom_object_status=mock_get_status),
@@ -1754,6 +1843,147 @@ class LWSRunnerJobTest(parameterized.TestCase):
                 # pytype: disable=attribute-error
                 job._pre_provisioner.delete_for.assert_called()
                 # pytype: enable=attribute-error
+
+    def test_rescheduled(self):
+        """Tests that RESCHEDULED status triggers _reschedule and continues the loop."""
+        cfg = self._job_config(
+            command="",
+            name="test-name",
+            cluster="test-cluster",
+        )
+        job: LWSRunnerJob = cfg.set(status_interval_seconds=0).instantiate(
+            bundler=mock.create_autospec(Bundler)
+        )
+
+        with mock.patch.multiple(
+            job,
+            _get_status=mock.Mock(
+                side_effect=[
+                    runner_gke.LWSRunnerJob.Status.RESCHEDULED,
+                    runner_gke.LWSRunnerJob.Status.FAILED,
+                ]
+            ),
+            _reschedule=mock.DEFAULT,
+            _inner=mock.DEFAULT,
+            _pre_provisioner=mock.DEFAULT,
+        ):
+            job._execute()
+
+            # _reschedule should be called once for the RESCHEDULED status.
+            job._reschedule.assert_called_once()  # pytype: disable=attribute-error
+
+    def test_get_status_rescheduled_tier_mismatch(self):
+        """Tests that _get_status returns RESCHEDULED when tier/reservation is mismatched."""
+        cfg = self._job_config(
+            command="test-command",
+            name="test-name",
+            cluster="test-cluster",
+        )
+        job: LWSRunnerJob = cfg.instantiate(bundler=mock.create_autospec(Bundler))
+
+        # LWS has a reservation but BASTION_TIER=1 (spot), so there is a mismatch.
+        mock_resp = dict(
+            metadata={},
+            status={},
+            spec=_mock_lws_spec(reservation="my-reservation"),
+        )
+        mock_get_status = mock.Mock(return_value=mock_resp)
+
+        with (
+            mock.patch.dict("os.environ", {"BASTION_TIER": "1"}),
+            mock.patch(
+                "kubernetes.client.CustomObjectsApi",
+                return_value=mock.Mock(get_namespaced_custom_object_status=mock_get_status),
+            ),
+        ):
+            self.assertEqual(LWSRunnerJob.Status.RESCHEDULED, job._get_status())
+
+    def test_reschedule_lws_deletes_mismatched_node_pools(self):
+        """Tests that _reschedule deletes node pools with mismatched tier (spot at tier=0)."""
+        cfg = self._job_config(
+            command="",
+            name="test-name",
+            cluster="test-cluster",
+        )
+        job: LWSRunnerJob = cfg.set(status_interval_seconds=0).instantiate(
+            bundler=mock.create_autospec(Bundler)
+        )
+
+        # A spot node pool exists, but BASTION_TIER=0 expects a reservation.
+        node_pool_by_label = {
+            "test-name": [
+                {
+                    "name": "pool0",
+                    "config": {
+                        "taints": [
+                            {
+                                "key": "cloud.google.com/gke-spot",
+                                "value": "true",
+                                "effect": "NO_SCHEDULE",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        mock_list = mock.Mock(return_value=node_pool_by_label)
+        mock_delete = mock.Mock()
+
+        with (
+            mock.patch.multiple(job, _inner=mock.DEFAULT, _pre_provisioner=None),
+            mock.patch.multiple(
+                runner_gke.__name__,
+                list_node_pools_by_label_key=mock_list,
+                delete_node_pools=mock_delete,
+            ),
+            mock.patch.dict("os.environ", {"BASTION_TIER": "0"}),
+        ):
+            job._reschedule()
+
+        mock_delete.assert_called_once()
+        args, _ = mock_delete.call_args
+        self.assertIn("pool0", args[0])
+
+    def test_reschedule_lws_skips_correct_node_pools(self):
+        """Tests that _reschedule skips node pools that already have the correct tier config."""
+        cfg = self._job_config(
+            command="",
+            name="test-name",
+            cluster="test-cluster",
+        )
+        job: LWSRunnerJob = cfg.set(status_interval_seconds=0).instantiate(
+            bundler=mock.create_autospec(Bundler)
+        )
+
+        # A reservation node pool exists and BASTION_TIER=0 expects a reservation — matches.
+        node_pool_by_label = {
+            "test-name": [
+                {
+                    "name": "pool0",
+                    "config": {
+                        "reservationAffinity": {
+                            "key": "compute.googleapis.com/reservation-name",
+                            "values": ["my-reservation"],
+                        },
+                    },
+                }
+            ]
+        }
+        mock_list = mock.Mock(return_value=node_pool_by_label)
+        mock_delete = mock.Mock()
+
+        with (
+            mock.patch.multiple(job, _inner=mock.DEFAULT, _pre_provisioner=None),
+            mock.patch.multiple(
+                runner_gke.__name__,
+                list_node_pools_by_label_key=mock_list,
+                delete_node_pools=mock_delete,
+            ),
+            mock.patch.dict("os.environ", {"BASTION_TIER": "0"}),
+        ):
+            job._reschedule()
+
+        mock_delete.assert_not_called()
 
     def test_name_alias(self):
         """Tests that names set via flag aliases are retained."""

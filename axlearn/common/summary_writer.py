@@ -105,7 +105,8 @@ class BaseWriter(Module):
 class CompositeWriter(BaseWriter):
     """A collection of named writers.
 
-    This class automatically sets the `dir` field of any child writers.
+    This class automatically sets the `dir` field of child writers that do not already have one.
+    Child writers with a pre-configured `dir` will retain their own value.
     """
 
     @config_class
@@ -118,9 +119,9 @@ class CompositeWriter(BaseWriter):
 
         self._writers: list[BaseWriter] = []
         for writer_name, writer_cfg in cfg.writers.items():
-            self._writers.append(
-                self._add_child(writer_name, writer_cfg.set(dir=os.path.join(cfg.dir, writer_name)))
-            )
+            if not writer_cfg.dir:
+                writer_cfg = writer_cfg.set(dir=os.path.join(cfg.dir, writer_name))
+            self._writers.append(self._add_child(writer_name, writer_cfg))
 
     @property
     def writers(self) -> list[BaseWriter]:
@@ -231,14 +232,15 @@ class SummaryWriter(BaseWriter):
                 If a type is not listed, `write_every_n_steps` is used as fallback. Each value must
                 be a positive integer multiple of `write_every_n_steps`.
             max_queue: Configures maximum number of summaries before flush.
-                If None, uses the `tf_summary` default (10).
+                Defaults to 1000. The original `tf_summary` default is 10, which is too small
+                and may cause frequent flushes to GCS, potentially blocking training.
             flush_ms: Largest interval between flushes in milliseconds.
                 If None, uses the `tf_summary` default (120,000, i.e. 2 minutes).
         """
 
         write_every_n_steps: int = 1
         write_every_n_steps_map: Optional[dict[SummaryKind, int]] = None
-        max_queue: Optional[int] = None
+        max_queue: int = 1000
         flush_ms: Optional[float] = None
 
     def __init__(self, cfg: BaseWriter.Config, *, parent: Optional[Module]):

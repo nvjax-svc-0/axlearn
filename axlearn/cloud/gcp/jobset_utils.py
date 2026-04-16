@@ -3,6 +3,7 @@
 """Utilities for building Jobset specs."""
 
 import io
+import json
 import logging
 import math
 import os
@@ -19,6 +20,7 @@ from axlearn.cloud.common.bastion import (
     deserialize_jobspec,
 )
 from axlearn.cloud.common.bundler import Bundler
+from axlearn.cloud.common.pod_mutator import PodMutator
 from axlearn.cloud.common.user_command_patcher import UserCommandPatcher
 from axlearn.cloud.common.utils import (
     AcceleratorConfig,
@@ -27,7 +29,9 @@ from axlearn.cloud.common.utils import (
     namespaced,
     parse_kv_flags,
 )
+from axlearn.cloud.gcp import topology_utils
 from axlearn.cloud.gcp.config import gcp_settings
+from axlearn.cloud.gcp.k8s_readiness_probe import ReadinessProbe
 from axlearn.cloud.gcp.node_pool import PRE_PROVISIONER_LABEL
 from axlearn.cloud.gcp.system_characteristics import (
     GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS,
@@ -42,6 +46,11 @@ from axlearn.common.utils import Nested
 
 # Set 80% of the max value as the requested memory.
 _MEMORY_REQUEST_PERCENTAGE = 0.8
+
+# Storage class constants for ephemeral persistent disk.
+_STORAGE_CLASS_PD_BALANCED = "pd-balanced"
+_STORAGE_CLASS_HYPERDISK_BALANCED = "hyperdisk-balanced"
+_PERSISTENT_DISK_SIZE_MAX_GIB = 2048
 
 
 # A label added to the jobset to indicate job version.
@@ -114,6 +123,21 @@ class HostMount(VolumeMount):
     type: str = "Directory"
 
 
+@dataclass(kw_only=True)
+class EphemeralDiskMount(VolumeMount):
+    """Configures an ephemeral PersistentVolumeClaim backed by a GCP storage class.
+
+    Attributes:
+        storage_class: Kubernetes StorageClass name (e.g. 'hyperdisk-balanced', 'pd-balanced').
+        size_gb: Requested disk size in GiB.
+    """
+
+    name: str = "persistent-disk"
+    mount_path: str = "/mnt"
+    storage_class: str
+    size_gb: int
+
+
 @dataclass
 class _LoadBalancer:
     """Configures the load balancer which exposes a K8s replicated job.
@@ -164,13 +188,14 @@ class BaseReplicatedJob(FlagConfigurable):
                 Each host's output will be placed in `"{output_dir}/output/$HOSTNAME/"`.
                 This directory is used by the sidecar container to sync outputs to GCS using gsutil.
                 Ensure that `output_dir` is a valid GCS path (e.g., `gs://your-bucket/path`).
-            image_id: An optional field to specify the image used for starting the container
+            image_id: An optional field to specify the image used for starting the container.
         """
 
         name: Required[str] = REQUIRED
         output_dir: Optional[str] = None
         image_id: Optional[str] = None
         user_command_patcher: Optional[UserCommandPatcher.Config] = None
+        pod_mutators: list[PodMutator.Config] = []
 
     @classmethod
     def define_flags(cls, fv):
@@ -193,6 +218,7 @@ class BaseReplicatedJob(FlagConfigurable):
         self._user_command_patcher = (
             cfg.user_command_patcher.instantiate() if cfg.user_command_patcher else None
         )
+        self._pod_mutators = [m.instantiate() for m in cfg.pod_mutators]
         self._bundler = bundler
 
     def __call__(self) -> Sequence[Nested[Any]]:
@@ -205,6 +231,24 @@ class BaseReplicatedJob(FlagConfigurable):
             The "template" should correspond to a k8s Job config.
         """
         raise NotImplementedError(type(self))
+
+    def get_workload_labels(self) -> dict[str, str]:
+        """Returns labels to be added to the parent jobset.
+
+        Returns:
+            A dict of labels to merge into the jobset metadata.
+            Empty dict if no additional labels are needed.
+        """
+        return {}
+
+    def get_workload_annotations(self) -> dict[str, str]:
+        """Returns annotations to be added to the parent jobset.
+
+        Returns:
+            A dict of annotations to merge into the jobset metadata.
+            Empty dict if no additional annotations are needed.
+        """
+        return {}
 
 
 @namespaced(mapping="inner")
@@ -232,6 +276,18 @@ class CompositeReplicatedJob(BaseReplicatedJob):
         for child in self._inner.values():
             composite.extend(child())
         return composite
+
+    def get_workload_labels(self) -> dict[str, str]:
+        result = {}
+        for child in self._inner.values():
+            result.update(child.get_workload_labels())
+        return result
+
+    def get_workload_annotations(self) -> dict[str, str]:
+        result = {}
+        for child in self._inner.values():
+            result.update(child.get_workload_annotations())
+        return result
 
 
 class SingleReplicatedJob(BaseReplicatedJob):
@@ -263,9 +319,11 @@ class SingleReplicatedJob(BaseReplicatedJob):
         env_vars: dict[str, str] = {}
         gcsfuse_mount: Optional[GCSFuseMount] = None
         host_mounts: Optional[Sequence[HostMount]] = None
+        ephemeral_disk: Optional[EphemeralDiskMount] = None
         service_account: Optional[str] = None
         # This config is made Optional for backwards compatibility. Default is False.
         enable_pre_provisioner: Optional[bool] = None
+        readiness_probe: ReadinessProbe.Config = ReadinessProbe.default_config()
 
     @classmethod
     def define_flags(cls, fv: flags.FlagValues):
@@ -322,6 +380,10 @@ class SingleReplicatedJob(BaseReplicatedJob):
             cls.verify_custom_topology_availability(cfg.accelerator)
         # pytype: enable=missing-parameter
         return cfg
+
+    def __init__(self, cfg: Config, *, bundler: Bundler):
+        super().__init__(cfg, bundler=bundler)
+        self.readiness_probe = cfg.readiness_probe.instantiate()
 
     @classmethod
     def verify_custom_topology_availability(cls, accelerator: AcceleratorConfig):
@@ -387,6 +449,12 @@ class TPUJobBuilder(SingleReplicatedJob):
                 https://github.com/GoogleCloudPlatform/ai-on-gke/blob/5f256eed7075a5cb8e73cd72328aea46237b8ce6/tpu-provisioner/internal/cloud/common.go#L29-L31
             job_labels: Optional dictionary of custom labels to be applied to the Job metadata.
                 These labels will be added in addition to the default job labels.
+            topology_assignment: An optional TPU topology assignment for this job.
+                Format: [["sub-block-id", ...], ...] where each inner list contains
+                subblock IDs for one replica. When enable_tpu_slice_auto_provisioning is True,
+                this is initialized from the environment variable in from_flags().
+            shared_memory_size_gb: Size limit in GiB for the /dev/shm shared memory volume
+                (e.g. 500 for 500Gi). Setting it to 0 means unlimited.
         """
 
         reservation: Optional[str] = None
@@ -398,6 +466,8 @@ class TPUJobBuilder(SingleReplicatedJob):
         priority_class: Optional[str] = None
         additional_node_networks: Optional[str] = None
         job_labels: Optional[dict[str, str]] = None
+        topology_assignment: Optional[list[list[str]]] = None
+        shared_memory_size_gb: Optional[int] = None
 
     @classmethod
     def define_flags(cls, fv: flags.FlagValues):
@@ -420,6 +490,18 @@ class TPUJobBuilder(SingleReplicatedJob):
             "priority_class",
             None,
             "The GKE PriorityClass for the job.",
+            **common_kwargs,
+        )
+        flags.DEFINE_integer(
+            "persistent_disk_size_gb",
+            None,
+            "If set, attach an ephemeral persistent disk of this size (GiB) mounted at /data.",
+            **common_kwargs,
+        )
+        flags.DEFINE_integer(
+            "shared_memory_size_gb",
+            None,
+            "Limit /dev/shm to this size in GiB (e.g. 500). 0 means unlimited.",
             **common_kwargs,
         )
 
@@ -445,6 +527,27 @@ class TPUJobBuilder(SingleReplicatedJob):
         cfg.additional_node_networks = gcp_settings(
             "additional_node_networks", required=False, fv=fv
         )
+
+        # Initialize topology from the environment when auto-provisioning is enabled.
+        if cfg.enable_tpu_slice_auto_provisioning:
+            cfg.topology_assignment = topology_utils.get_topology_from_env()
+
+        if fv.persistent_disk_size_gb is not None:
+            if not 0 < fv.persistent_disk_size_gb <= _PERSISTENT_DISK_SIZE_MAX_GIB:
+                raise ValueError(
+                    f"--persistent_disk_size_gb={fv.persistent_disk_size_gb} must be between 1 and "
+                    f"{_PERSISTENT_DISK_SIZE_MAX_GIB} GiB."
+                )
+            tpu_version = infer_tpu_version(infer_tpu_type(fv.instance_type))
+            # v5p and v5litepod do not support hyperdisk-balanced, so fall back to pd-balanced.
+            if tpu_version in ("v5p", "v5litepod"):
+                storage_class = _STORAGE_CLASS_PD_BALANCED
+            else:
+                storage_class = _STORAGE_CLASS_HYPERDISK_BALANCED
+            cfg.ephemeral_disk = EphemeralDiskMount(
+                storage_class=storage_class,
+                size_gb=fv.persistent_disk_size_gb,
+            )
         return cfg
 
     def __init__(self, cfg: Config, *, bundler: Bundler):
@@ -452,6 +555,8 @@ class TPUJobBuilder(SingleReplicatedJob):
         cfg: TPUJobBuilder.Config = self.config
         if cfg.output_dir is None:
             raise ValueError("cfg.output_dir is required.")
+        if cfg.shared_memory_size_gb is not None and cfg.shared_memory_size_gb < 0:
+            raise ValueError(f"--shared_memory_size_gb={cfg.shared_memory_size_gb} must be >= 0.")
         self._tpu_type = infer_tpu_type(cfg.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
             raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
@@ -484,6 +589,7 @@ class TPUJobBuilder(SingleReplicatedJob):
 
         if cfg.gcsfuse_mount:
             self._maybe_add_volume_mount(volume_mounts, spec=cfg.gcsfuse_mount)
+        if cfg.gcsfuse_mount or cfg.shared_memory_size_gb is not None:
             self._maybe_add_volume_mount(
                 volume_mounts, spec=VolumeMount(name="shared-memory", mount_path="/dev/shm")
             )
@@ -491,6 +597,9 @@ class TPUJobBuilder(SingleReplicatedJob):
         if cfg.host_mounts:
             for mount in cfg.host_mounts:
                 self._maybe_add_volume_mount(volume_mounts, spec=mount)
+
+        if cfg.ephemeral_disk:
+            self._maybe_add_volume_mount(volume_mounts, spec=cfg.ephemeral_disk)
 
         env_vars = {**cfg.env_vars}
         if cfg.enable_tpu_ici_resiliency is not None:
@@ -563,17 +672,20 @@ class TPUJobBuilder(SingleReplicatedJob):
 
         # Apply command transformation if configured
         command = cfg.command
+        spec = None
+        if os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
+            spec = deserialize_jobspec(
+                io.StringIO(os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR))
+            )
         if self._user_command_patcher:
             # Get user_id from Bastion environment if available
-            user_id = None
-            if os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
-                spec = deserialize_jobspec(
-                    io.StringIO(os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR))
-                )
-                user_id = spec.metadata.user_id
+            user_id = spec.metadata.user_id if spec is not None else None
             command = self._user_command_patcher.patch(command, user_id=user_id)
 
-        return dict(
+        if spec is not None and spec.code_asset_path:
+            command = f"{self._bundler.install_command(spec.code_asset_path)} && {command}"
+
+        container = dict(
             name=cfg.name,
             image=cfg.image_id or self._bundler.id(cfg.name),
             # https://cloud.google.com/kubernetes-engine/docs/how-to/tpus#tpu-chips-node-pool
@@ -593,6 +705,10 @@ class TPUJobBuilder(SingleReplicatedJob):
             volumeMounts=volume_mounts,
             imagePullPolicy="Always",
         )
+        probe = self.readiness_probe
+        if probe.is_configured():
+            container["readinessProbe"] = probe.build_readiness_probe()
+        return container
 
     def _build_uploader_container(
         self, src: str = "/output", output_volume_mount: Optional[dict] = None
@@ -695,10 +811,14 @@ class TPUJobBuilder(SingleReplicatedJob):
         cfg: TPUJobBuilder.Config = self.config
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         annotations, labels, selector, volumes, tolerations = {}, {}, {}, [], []
+        annotations["axlearn/main-container"] = cfg.name
 
         volumes.append(dict(name="shared-output", emptyDir={}))
         if cfg.gcsfuse_mount:
             self.set_up_gcsfuse(cfg, volumes, annotations)
+        elif cfg.shared_memory_size_gb is not None:
+            # when shared_memory_size_gb is set (int), create shared-memory volume
+            volumes.append(self._build_shared_memory_volumes(f"{cfg.shared_memory_size_gb}Gi"))
         if cfg.host_mounts:
             for mount in cfg.host_mounts:
                 volumes.append(
@@ -707,6 +827,24 @@ class TPUJobBuilder(SingleReplicatedJob):
                         hostPath=dict(path=mount.host_path, type=mount.type),
                     )
                 )
+
+        if cfg.ephemeral_disk:
+            volumes.append(
+                dict(
+                    name=cfg.ephemeral_disk.name,
+                    ephemeral=dict(
+                        volumeClaimTemplate=dict(
+                            spec=dict(
+                                accessModes=["ReadWriteOnce"],
+                                storageClassName=cfg.ephemeral_disk.storage_class,
+                                resources=dict(
+                                    requests=dict(storage=f"{cfg.ephemeral_disk.size_gb}Gi")
+                                ),
+                            )
+                        )
+                    ),
+                )
+            )
 
         # If running from bastion, a scheduling tier will be specified in env.
         # Tier "0" corresponds to reserved; otherwise we use preemptible.
@@ -770,18 +908,19 @@ class TPUJobBuilder(SingleReplicatedJob):
         if os.environ.get(BASTION_JOB_VERSION_ENV_VAR):
             labels.update({BASTION_JOB_VERSION_LABEL: os.environ.get(BASTION_JOB_VERSION_ENV_VAR)})
 
+        job_spec = None
         if os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
-            spec = deserialize_jobspec(
+            job_spec = deserialize_jobspec(
                 io.StringIO(os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR))
             )
 
-            labels.update({"job-priority": str(spec.metadata.priority)})
-            labels.update({"user-id": spec.metadata.user_id})
-            labels.update({"project-id": spec.metadata.project_id})
+            labels.update({"job-priority": str(job_spec.metadata.priority)})
+            labels.update({"user-id": job_spec.metadata.user_id})
+            labels.update({"project-id": job_spec.metadata.project_id})
 
             # For job-priority to be populated to node labels when tpu-provisioner is used.
             if not cfg.enable_tpu_slice_auto_provisioning:
-                selector.update({"job-priority": str(spec.metadata.priority)})
+                selector.update({"job-priority": str(job_spec.metadata.priority)})
 
         labels.update({"num-replicas": str(cfg.accelerator.num_replicas)})
 
@@ -870,10 +1009,15 @@ class TPUJobBuilder(SingleReplicatedJob):
             spec["hostNetwork"] = True
             spec["dnsPolicy"] = "ClusterFirstWithHostNet"
 
-        return dict(
+        pod = dict(
             metadata=dict(annotations=annotations, labels=labels),
             spec=spec,
         )
+
+        for mutator_cfg in cfg.pod_mutators:
+            pod = mutator_cfg.instantiate().mutate(job_spec, pod)
+
+        return pod
 
     def _build_job_labels(self) -> dict[str, str]:
         """Builds labels for the Job metadata.
@@ -895,6 +1039,22 @@ class TPUJobBuilder(SingleReplicatedJob):
             )
 
         return labels
+
+    def get_workload_labels(self) -> dict[str, str]:
+        cfg: TPUJobBuilder.Config = self.config
+        if cfg.enable_tpu_slice_auto_provisioning and cfg.topology_assignment:
+            return {"tpu-provisioner.cloud.google.com/slice-autoprovisioning": "sync"}
+        return {}
+
+    def get_workload_annotations(self) -> dict[str, str]:
+        cfg: TPUJobBuilder.Config = self.config
+        if cfg.enable_tpu_slice_auto_provisioning and cfg.topology_assignment:
+            return {
+                "tpu-provisioner.cloud.google.com/slice-selection": json.dumps(
+                    {cfg.job_name: cfg.topology_assignment}
+                )
+            }
+        return {}
 
 
 class TPUReplicatedJob(TPUJobBuilder):
@@ -972,7 +1132,7 @@ class GPUReplicatedJob(SingleReplicatedJob):
         # Leave trailing space for A3 / A4-specific XLA flags to be added later
         env_vars["XLA_FLAGS"] += " "
 
-        return dict(
+        container = dict(
             name=cfg.name,
             image=self._bundler.id(cfg.name),
             ports=[
@@ -984,6 +1144,10 @@ class GPUReplicatedJob(SingleReplicatedJob):
             env=env_vars,
             volumeMounts=volume_mounts,
         )
+        probe = self.readiness_probe
+        if probe.is_configured():
+            container["readinessProbe"] = probe.build_readiness_probe()
+        return container
 
     def _build_volumes(self) -> Nested[Any]:
         """Builds a config for volumes."""
@@ -1017,7 +1181,7 @@ class GPUReplicatedJob(SingleReplicatedJob):
         containers = [self._build_main_container()]
         init_containers = self._build_init_containers()
 
-        return dict(
+        pod = dict(
             metadata=dict(annotations=annotations),
             spec=dict(
                 terminationGracePeriodSeconds=60,
@@ -1031,6 +1195,11 @@ class GPUReplicatedJob(SingleReplicatedJob):
                 volumes=volumes,
             ),
         )
+
+        for mutator_cfg in cfg.pod_mutators:
+            pod = mutator_cfg.instantiate().mutate(None, pod)
+
+        return pod
 
     def _build_job(self) -> Nested[Any]:
         """Builds a config for a single Job, which is a set of Pods.

@@ -4,6 +4,7 @@
 
 import contextlib
 import io
+import json
 import math
 import os
 from datetime import datetime
@@ -21,6 +22,7 @@ from axlearn.cloud.common.bastion import (
     serialize_jobspec,
 )
 from axlearn.cloud.common.bundler import Bundler
+from axlearn.cloud.common.pod_mutator import PodMutator
 from axlearn.cloud.common.types import JobMetadata
 from axlearn.cloud.common.utils import AcceleratorConfig, define_flags, from_flags
 from axlearn.cloud.gcp import bundler, jobset_utils
@@ -30,9 +32,11 @@ from axlearn.cloud.gcp.jobset_utils import (
     _ANNOTATION_NODE_SERVICE_ACCOUNT,
     _MEMORY_REQUEST_PERCENTAGE,
     _METADATA_GOOGLE_INTERNAL_IP,
+    _PERSISTENT_DISK_SIZE_MAX_GIB,
     BASTION_JOB_VERSION_LABEL,
     BaseReplicatedJob,
     CompositeReplicatedJob,
+    EphemeralDiskMount,
     GCSFuseMount,
     HostMount,
     TPUReplicatedJob,
@@ -320,18 +324,30 @@ class TPUReplicatedJobTest(TestCase):
                 else:
                     self.fail("host-mount not found!")
 
-            if gcsfuse_mount_spec:
-                self.assertIn("shared-memory", [v["name"] for v in pod_spec["volumes"]])
+            # shared-memory volume is present when gcsfuse or shared_memory_size_gb is set.
+            volume_names = [v["name"] for v in pod_spec["volumes"]]
+            if gcsfuse_mount_spec or cfg.shared_memory_size_gb is not None:
+                self.assertIn("shared-memory", volume_names)
                 for v in pod_spec["volumes"]:
                     if v["name"] == "shared-memory":
-                        self.assertIn("sizeLimit", v["emptyDir"])
-                        size_limit_request = [x for x in gcsfuse_mount_spec if "shared_memory" in x]
-                        self.assertLessEqual(len(size_limit_request), 1)
-                        if size_limit_request:
-                            size_limit_request = size_limit_request[0].split("=")[1]
-                            self.assertEqual(v["emptyDir"]["sizeLimit"], size_limit_request)
+                        self.assertEqual(v["emptyDir"]["medium"], "Memory")
+                        if gcsfuse_mount_spec:
+                            # When gcsfuse is enabled, sizeLimit comes from gcsfuse shared_memory.
+                            size_limit_request = [
+                                x for x in gcsfuse_mount_spec if "shared_memory" in x
+                            ]
+                            if size_limit_request:
+                                expected = size_limit_request[0].split("=")[1]
+                            else:
+                                expected = "1Gi"  # GCSFuseMount default
+                            self.assertEqual(v["emptyDir"]["sizeLimit"], expected)
+                        else:
+                            # Without gcsfuse, uses shared_memory_size_gb.
+                            self.assertEqual(
+                                v["emptyDir"]["sizeLimit"], f"{cfg.shared_memory_size_gb}Gi"
+                            )
             else:
-                self.assertNotIn("shared-memory", [v["name"] for v in pod_spec["volumes"]])
+                self.assertNotIn("shared-memory", volume_names)
 
             self.assertEqual(container["imagePullPolicy"], "Always")
 
@@ -579,6 +595,193 @@ class TPUReplicatedJobTest(TestCase):
         else:
             TPUReplicatedJob.verify_custom_topology_availability(accelerator)
 
+    @parameterized.parameters(
+        # v6e → hyperdisk-balanced
+        dict(
+            instance_type="tpu-v6e-16",
+            persistent_disk_size_gb=500,
+            expected_class="hyperdisk-balanced",
+        ),
+        # v4 → hyperdisk-balanced
+        dict(
+            instance_type="tpu-v4-8",
+            persistent_disk_size_gb=100,
+            expected_class="hyperdisk-balanced",
+        ),
+        # v5p → pd-balanced
+        dict(instance_type="tpu-v5p-8", persistent_disk_size_gb=200, expected_class="pd-balanced"),
+        # v5litepod → pd-balanced
+        dict(
+            instance_type="tpu-v5litepod-16",
+            persistent_disk_size_gb=300,
+            expected_class="pd-balanced",
+        ),
+    )
+    def test_persistent_disk_storage_class(
+        self, instance_type, persistent_disk_size_gb, expected_class
+    ):
+        """Tests that from_flags sets the correct storage class for ephemeral_disk."""
+        with mock_gcp_settings([jobset_utils.__name__, bundler.__name__]):
+            fv = flags.FlagValues()
+            jobset_utils.TPUReplicatedJob.define_flags(fv)
+            fv.set_default("name", "test-name")
+            fv.set_default("instance_type", instance_type)
+            fv.set_default("topology", None)
+            setattr(fv, "persistent_disk_size_gb", persistent_disk_size_gb)
+            fv.mark_as_parsed()
+            cfg = jobset_utils.TPUReplicatedJob.from_flags(fv)
+            self.assertIsNotNone(cfg.ephemeral_disk)
+            self.assertEqual(cfg.ephemeral_disk.storage_class, expected_class)
+            self.assertEqual(cfg.ephemeral_disk.size_gb, persistent_disk_size_gb)
+            self.assertEqual(cfg.ephemeral_disk.name, "persistent-disk")
+            self.assertEqual(cfg.ephemeral_disk.mount_path, "/mnt")
+
+    def test_no_persistent_disk_when_flag_unset(self):
+        """Tests that ephemeral_disk is None when --persistent_disk_size_gb is not provided."""
+        with mock_gcp_settings([jobset_utils.__name__, bundler.__name__]):
+            fv = flags.FlagValues()
+            jobset_utils.TPUReplicatedJob.define_flags(fv)
+            fv.set_default("name", "test-name")
+            fv.set_default("instance_type", "tpu-v6e-16")
+            fv.set_default("topology", None)
+            fv.mark_as_parsed()
+            cfg = jobset_utils.TPUReplicatedJob.from_flags(fv)
+            self.assertIsNone(cfg.ephemeral_disk)
+
+    def test_persistent_disk_size_exceeds_limit(self):
+        """Tests that from_flags raises ValueError when persistent_disk_size_gb is out of range."""
+        with mock_gcp_settings([jobset_utils.__name__, bundler.__name__]):
+            for bad_size in (0, -1, _PERSISTENT_DISK_SIZE_MAX_GIB + 1):
+                fv = flags.FlagValues()
+                jobset_utils.TPUReplicatedJob.define_flags(fv)
+                fv.set_default("name", "test-name")
+                fv.set_default("instance_type", "tpu-v6e-16")
+                fv.set_default("topology", None)
+                setattr(fv, "persistent_disk_size_gb", bad_size)
+                fv.mark_as_parsed()
+                with self.assertRaisesRegex(ValueError, "must be between"):
+                    jobset_utils.TPUReplicatedJob.from_flags(fv)
+
+    @parameterized.parameters(
+        dict(
+            instance_type="tpu-v6e-16",
+            persistent_disk_size_gb=500,
+            expected_class="hyperdisk-balanced",
+        ),
+        dict(instance_type="tpu-v5p-8", persistent_disk_size_gb=200, expected_class="pd-balanced"),
+    )
+    def test_persistent_disk_pod_spec(self, instance_type, persistent_disk_size_gb, expected_class):
+        """Tests that _build_pod and _build_container include ephemeral disk volume and mount."""
+        with self._job_config(
+            bundler_cls=ArtifactRegistryBundler,
+            instance_type=instance_type,
+            persistent_disk_size_gb=persistent_disk_size_gb,
+        ) as (cfg, bundler_cfg):
+            cfg.set(command="test-command", output_dir="gs://bucket/output")
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = job._build_pod()  # pylint: disable=protected-access
+
+            # Check that the ephemeral volume is present in pod volumes.
+            volumes = pod["spec"]["volumes"]
+            ephemeral_vols = [v for v in volumes if v.get("name") == "persistent-disk"]
+            self.assertLen(ephemeral_vols, 1)
+            vol = ephemeral_vols[0]
+            self.assertIn("ephemeral", vol)
+            claim_spec = vol["ephemeral"]["volumeClaimTemplate"]["spec"]
+            self.assertEqual(claim_spec["storageClassName"], expected_class)
+            self.assertEqual(claim_spec["accessModes"], ["ReadWriteOnce"])
+            self.assertEqual(
+                claim_spec["resources"]["requests"]["storage"],
+                f"{persistent_disk_size_gb}Gi",
+            )
+
+            # Check that the volume mount is present in the main container.
+            container = job._build_container()  # pylint: disable=protected-access
+            mounts = container["volumeMounts"]
+            data_mounts = [m for m in mounts if m.get("name") == "persistent-disk"]
+            self.assertLen(data_mounts, 1)
+            self.assertEqual(data_mounts[0]["mountPath"], "/mnt")
+
+    def test_no_persistent_disk_pod_spec(self):
+        """Tests that no ephemeral disk volume or mount appears when flag is not set."""
+        with self._job_config(
+            bundler_cls=ArtifactRegistryBundler,
+            instance_type="tpu-v6e-16",
+        ) as (cfg, bundler_cfg):
+            cfg.set(command="test-command", output_dir="gs://bucket/output")
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = job._build_pod()  # pylint: disable=protected-access
+
+            volumes = pod["spec"]["volumes"]
+            ephemeral_vols = [v for v in volumes if v.get("name") == "persistent-disk"]
+            self.assertEmpty(ephemeral_vols)
+
+            container = job._build_container()  # pylint: disable=protected-access
+            mounts = container["volumeMounts"]
+            data_mounts = [m for m in mounts if m.get("name") == "persistent-disk"]
+            self.assertEmpty(data_mounts)
+
+    def test_shared_memory_default_no_volume(self):
+        """Tests that shared-memory volume is not created when shared_memory_size_gb is None."""
+        with self._job_config(bundler_cls=ArtifactRegistryBundler) as (cfg, bundler_cfg):
+            cfg.set(command="test-command", output_dir="gs://bucket/output")
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = job._build_pod()  # pylint: disable=protected-access
+            volumes = pod["spec"]["volumes"]
+            shm_vols = [v for v in volumes if v["name"] == "shared-memory"]
+            self.assertEmpty(shm_vols)
+
+    def test_shared_memory_with_size_limit(self):
+        """Tests that shared-memory volume respects shared_memory_size_gb config."""
+        with self._job_config(bundler_cls=ArtifactRegistryBundler) as (cfg, bundler_cfg):
+            cfg.set(
+                command="test-command",
+                output_dir="gs://bucket/output",
+                shared_memory_size_gb=500,
+            )
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = job._build_pod()  # pylint: disable=protected-access
+            volumes = pod["spec"]["volumes"]
+            shm_vols = [v for v in volumes if v["name"] == "shared-memory"]
+            self.assertLen(shm_vols, 1)
+            self.assertEqual(shm_vols[0]["emptyDir"]["medium"], "Memory")
+            self.assertEqual(shm_vols[0]["emptyDir"]["sizeLimit"], "500Gi")
+
+    def test_shared_memory_volume_mount_not_present_by_default(self):
+        """Tests that /dev/shm volume mount is not present when shared_memory_size_gb is None."""
+        with self._job_config(bundler_cls=ArtifactRegistryBundler) as (cfg, bundler_cfg):
+            cfg.set(command="test-command", output_dir="gs://bucket/output")
+            self.assertIsNone(cfg.gcsfuse_mount)
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            container = job._build_container()  # pylint: disable=protected-access
+            shm_mounts = [m for m in container["volumeMounts"] if m.get("name") == "shared-memory"]
+            self.assertEmpty(shm_mounts)
+
+    def test_shared_memory_size_gb_zero_means_unlimited(self):
+        """Tests that shared_memory_size_gb=0 means unlimited (no sizeLimit)."""
+        with self._job_config(bundler_cls=ArtifactRegistryBundler) as (cfg, bundler_cfg):
+            cfg.set(
+                command="test-command",
+                output_dir="gs://bucket/output",
+                shared_memory_size_gb=0,
+            )
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = job._build_pod()  # pylint: disable=protected-access
+            volumes = pod["spec"]["volumes"]
+            shm_vols = [v for v in volumes if v["name"] == "shared-memory"]
+            self.assertLen(shm_vols, 1)
+            self.assertEqual(shm_vols[0]["emptyDir"]["medium"], "Memory")
+            self.assertEqual(shm_vols[0]["emptyDir"]["sizeLimit"], "0Gi")
+
+    def test_ephemeral_disk_mount_dataclass(self):
+        """Tests EphemeralDiskMount defaults and field assignment."""
+        m = EphemeralDiskMount(storage_class="hyperdisk-balanced", size_gb=500)
+        self.assertEqual(m.name, "persistent-disk")
+        self.assertEqual(m.mount_path, "/mnt")
+        self.assertEqual(m.storage_class, "hyperdisk-balanced")
+        self.assertEqual(m.size_gb, 500)
+        self.assertEqual(m.read_only, False)
+
 
 class CompositeReplicatedJobTest(TestCase):
     def test_composite_replicated_job(self):
@@ -686,3 +889,115 @@ class A3HighReplicatedJobTest(TestCase):
                 self.assertEqual(
                     main_container_env_vars["XLA_FLAGS"]["value"], env_vars["XLA_FLAGS"]
                 )
+
+    def test_gpu_pod_mutators(self):
+        """Tests that pod_mutators are applied in GPUReplicatedJob._build_pod()."""
+        with self._job_config(ArtifactRegistryBundler, num_replicas=1) as (cfg, bundler_cfg):
+
+            class _TestMutator(PodMutator):
+                @jobset_utils.config_class
+                class Config(PodMutator.Config):
+                    marker: str = ""
+
+                def mutate(self, job_spec, pod):
+                    pod["metadata"]["annotations"]["test-mutator"] = self.config.marker
+                    return pod
+
+            cfg.pod_mutators = [_TestMutator.default_config().set(marker="gpu-marker")]
+            job = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            result = job()
+            pod = result[0]["template"]["spec"]["template"]
+            self.assertEqual(pod["metadata"]["annotations"]["test-mutator"], "gpu-marker")
+
+
+class TopologyAssignmentTest(TestCase):
+    """Tests topology assignment functionality."""
+
+    def _tpu_child_config(
+        self,
+        *,
+        job_name: str = "worker",
+        instance_type: str = "tpu-7x-128",
+        num_replicas: int = 1,
+        enable_tpu_slice_auto_provisioning: bool = True,
+    ):
+        """Helper to create a TPUReplicatedJob config for composite job tests."""
+        return TPUReplicatedJob.default_config().set(
+            name=job_name,
+            job_name=job_name,
+            command="echo test",
+            project="test-project",
+            output_dir="gs://test-bucket/output",
+            accelerator=AcceleratorConfig(instance_type=instance_type, num_replicas=num_replicas),
+            enable_tpu_slice_auto_provisioning=enable_tpu_slice_auto_provisioning,
+        )
+
+    def test_tpu_job_get_workload_labels_with_topology(self):
+        """TPUJobBuilder.get_workload_labels returns slice-autoprovisioning label."""
+        with mock_gcp_settings([jobset_utils.__name__]):
+            child_cfg = self._tpu_child_config(job_name="worker")
+            child_cfg.topology_assignment = [["sb-1"]]
+            job = child_cfg.instantiate(bundler=mock.create_autospec(Bundler))
+            self.assertEqual(
+                {"tpu-provisioner.cloud.google.com/slice-autoprovisioning": "sync"},
+                job.get_workload_labels(),
+            )
+
+    def test_tpu_job_get_workload_annotations_with_topology(self):
+        """TPUJobBuilder.get_workload_annotations returns slice-selection annotation."""
+        with mock_gcp_settings([jobset_utils.__name__]):
+            child_cfg = self._tpu_child_config(job_name="worker")
+            child_cfg.topology_assignment = [["sb-1"]]
+            job = child_cfg.instantiate(bundler=mock.create_autospec(Bundler))
+            annotations = job.get_workload_annotations()
+            self.assertIn("tpu-provisioner.cloud.google.com/slice-selection", annotations)
+            selection = json.loads(annotations["tpu-provisioner.cloud.google.com/slice-selection"])
+            self.assertEqual({"worker": [["sb-1"]]}, selection)
+
+    def test_tpu_job_get_workload_labels_without_topology(self):
+        """TPUJobBuilder.get_workload_labels returns empty dict when no topology."""
+        with mock_gcp_settings([jobset_utils.__name__]):
+            child_cfg = self._tpu_child_config(job_name="worker")
+            job = child_cfg.instantiate(bundler=mock.create_autospec(Bundler))
+            self.assertEqual({}, job.get_workload_labels())
+            self.assertEqual({}, job.get_workload_annotations())
+
+    def test_tpu_job_get_workload_labels_provisioning_disabled(self):
+        """TPUJobBuilder.get_workload_labels returns empty dict when provisioning disabled."""
+        with mock_gcp_settings([jobset_utils.__name__]):
+            child_cfg = self._tpu_child_config(
+                job_name="worker", enable_tpu_slice_auto_provisioning=False
+            )
+            child_cfg.topology_assignment = [["sb-1"]]
+            job = child_cfg.instantiate(bundler=mock.create_autospec(Bundler))
+            self.assertEqual({}, job.get_workload_labels())
+            self.assertEqual({}, job.get_workload_annotations())
+
+    def test_composite_get_workload_labels_merges_children(self):
+        """CompositeReplicatedJob.get_workload_labels merges from enabled children."""
+        with mock_gcp_settings([jobset_utils.__name__]):
+            child_cfg = self._tpu_child_config(job_name="worker")
+            child_cfg.topology_assignment = [["sb-1"]]
+            composite_cfg = CompositeReplicatedJob.default_config().set(
+                name="composite", inner={"a": child_cfg}
+            )
+            composite = composite_cfg.instantiate(bundler=mock.create_autospec(Bundler))
+            self.assertEqual(
+                {"tpu-provisioner.cloud.google.com/slice-autoprovisioning": "sync"},
+                composite.get_workload_labels(),
+            )
+
+    def test_composite_get_workload_annotations_merges_children(self):
+        """CompositeReplicatedJob.get_workload_annotations merges from enabled children."""
+        with mock_gcp_settings([jobset_utils.__name__]):
+            child_a = self._tpu_child_config(job_name="a-worker")
+            child_a.topology_assignment = [["sb-1"]]
+            child_b = self._tpu_child_config(job_name="b-worker")
+            child_b.topology_assignment = [["sb-2"]]
+            composite_cfg = CompositeReplicatedJob.default_config().set(
+                name="composite", inner={"a": child_a, "b": child_b}
+            )
+            composite = composite_cfg.instantiate(bundler=mock.create_autospec(Bundler))
+            annotations = composite.get_workload_annotations()
+            # Both children contribute; annotations will be merged (last wins for same key)
+            self.assertIn("tpu-provisioner.cloud.google.com/slice-selection", annotations)

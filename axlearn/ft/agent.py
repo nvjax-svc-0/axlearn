@@ -3,27 +3,29 @@
 """Entrypoint function for launching the fault tolerant agent.
 
 The agent spawns the trainer in a subprocess for fault tolerance and process isolation.
+Agent flags and trainer flags are separated by ``--``. Everything after ``--`` is forwarded
+verbatim to the trainer subprocess.
 
 Example usage:
 python3 -m axlearn.ft.agent \
+  --max_restarts=5 \
+  -- \
   --module=text.gpt.c4_trainer \
   --config=fuji-70B-v2-flash \
   --trainer_dir=gs://bucket/experiments/test \
   --data_dir=gs://bucket/tensorflow_datasets \
-  --jax_backend=tpu \
-  --max_restarts=5
+  --jax_backend=tpu
 """
 
 import enum
+import shlex
 import signal
 import subprocess
 import sys
 
 from absl import app, flags, logging
 
-# Import launch and launch_trainer to get the FLAGS definitions.
-from axlearn.common import launch, launch_trainer, measurement  # pylint: disable=unused-import
-from axlearn.ft.monitor import StatusMonitor
+from axlearn.ft.monitor import StatusMonitor, StragglerMonitor
 from axlearn.ft.utils import TrainerProcessController
 
 
@@ -39,6 +41,29 @@ _POD_SHUTDOWN_REASON_PREFIX = "Pod shutdown signal"
 
 flags.DEFINE_integer(
     "max_restarts", 3, "Maximum number of times to restart the trainer subprocess on failure"
+)
+flags.DEFINE_string(
+    "trainer_cmd",
+    None,
+    "The trainer command to run as a subprocess. "
+    "If not set, defaults to 'python3 -m axlearn.common.launch_trainer_main'.",
+)
+flags.DEFINE_boolean(
+    "straggler_detection",
+    True,
+    "Enable detection of workers that are slowing down overall training progress.",
+)
+flags.DEFINE_float(
+    "straggler_worker_sensitivity",
+    8.0,
+    # pylint: disable=line-too-long
+    "Number of standard deviations (for tensorcore utilization) from median to consider a worker a straggler. "
+    "Lower values are more sensitive, higher values are more forgiving, 8.0 is a good medium for workloads.",
+)
+flags.DEFINE_integer(
+    "straggler_worker_sustained_duration_seconds",
+    300,
+    "Seconds a worker must be continuously a straggler before taking action.",
 )
 
 
@@ -78,18 +103,85 @@ def _handle_termination_request(
     return TerminationAction.RESTART
 
 
-def run_ft_agent():
-    """The agent launches trainer as a subprocess with fault tolerance."""
+def _run_single_attempt(
+    entrypoint_cmd: list[str],
+    restart_count: int,
+    max_restarts: int,
+    process_controller: TrainerProcessController,
+    monitor: "StatusMonitor",
+) -> TerminationAction | None:
+    """Run a single trainer attempt and return the action to take.
+
+    Args:
+        entrypoint_cmd: Command to launch the trainer subprocess.
+        restart_count: Current restart attempt number.
+        max_restarts: Maximum allowed restarts.
+        process_controller: Controller for the trainer process.
+        monitor: Status monitor for the trainer.
+
+    Returns:
+        TerminationAction.EXIT if the agent should exit gracefully,
+        TerminationAction.RESTART if a coordinated restart was requested,
+        None if the attempt failed and the caller should increment restart_count and retry.
+
+    Raises:
+        RuntimeError: When training fails and max restarts are exhausted.
+    """
+    with subprocess.Popen(
+        entrypoint_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        process_controller.set_process(process)
+        returncode = monitor.monitor_training_process(process)
+        process_controller.clear_process()
+
+        action = _handle_termination_request(process_controller)
+        if action is not None:
+            return action
+
+        if returncode == 0:
+            logging.info("FT Agent: Training completed successfully")
+            return TerminationAction.EXIT
+
+        if restart_count < max_restarts:
+            logging.error("FT Agent: Training failed (code %d), restarting...", returncode)
+        else:
+            logging.error("FT Agent: Max restarts (%d) reached", max_restarts)
+            raise RuntimeError(f"Max restarts reached, last exit code: {returncode}")
+
+    return None
+
+
+def run_ft_agent(trainer_argv: list[str]):
+    """The agent launches trainer as a subprocess with fault tolerance.
+
+    Args:
+        trainer_argv: Arguments to forward to the trainer subprocess.
+    """
     logging.info("Starting fault tolerant trainer agent...")
 
     # Initialize FT system
     process_controller = TrainerProcessController()
-    monitor = StatusMonitor(process_controller=process_controller)
+    straggler_monitor = StragglerMonitor(
+        enabled=flags.FLAGS.straggler_detection,
+        sensitivity=flags.FLAGS.straggler_worker_sensitivity,
+        sustained_duration_seconds=flags.FLAGS.straggler_worker_sustained_duration_seconds,
+    )
+    monitor = StatusMonitor(
+        process_controller=process_controller,
+        straggler_monitor=straggler_monitor,
+    )
     monitor.start()
 
     # Build trainer command
-    entrypoint_cmd = [sys.executable, "-m", "axlearn.common.launch_trainer_main"]
-    entrypoint_cmd.extend(arg for arg in sys.argv[1:] if not arg.startswith("--max_restarts"))
+    if flags.FLAGS.trainer_cmd:
+        entrypoint_cmd = shlex.split(flags.FLAGS.trainer_cmd)
+    else:
+        entrypoint_cmd = [sys.executable, "-m", "axlearn.common.launch_trainer_main"]
+    entrypoint_cmd.extend(trainer_argv)
 
     # Set up signal handling
     def signal_handler(signum, *_):
@@ -106,7 +198,7 @@ def run_ft_agent():
             logging.error("FT Agent: Failed to report pod shutdown: %s", e)
 
         # Terminate the trainer process
-        logging.info("FT Agent: Terminating trainer due to signal %d", signum)
+        logging.debug("FT Agent: Terminating trainer due to signal %d", signum)
         process_controller.terminate_training(f"{_POD_SHUTDOWN_REASON_PREFIX} {signum}")
 
         logging.warning("FT Agent: exit with non-zero code due to signal %d recieved.", signum)
@@ -127,37 +219,19 @@ def run_ft_agent():
             try:
                 # Start trainer in its own process group (start_new_session=True)
                 # This allows os.killpg() to terminate all threads cleanly
-                with subprocess.Popen(
-                    entrypoint_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                ) as process:
-                    process_controller.set_process(process)
-                    returncode = monitor.monitor_training_process(process)
-                    process_controller.clear_process()
+                action = _run_single_attempt(
+                    entrypoint_cmd, restart_count, max_restarts, process_controller, monitor
+                )
+                if action == TerminationAction.EXIT:
+                    return
+                if action == TerminationAction.RESTART:
+                    continue  # Coordinated restart - don't increment restart_count
+                restart_count += 1
 
-                    # Handle termination requests (SIGTERM or coordinated restart)
-                    action = _handle_termination_request(process_controller)
-                    if action == TerminationAction.EXIT:
-                        return
-                    if action == TerminationAction.RESTART:
-                        continue  # Restart without incrementing restart_count
-
-                    if returncode == 0:
-                        logging.info("FT Agent: Training completed successfully")
-                        return
-                    elif restart_count < max_restarts:
-                        restart_count += 1
-                        logging.error(
-                            "FT Agent: Training failed (code %d), restarting...", returncode
-                        )
-                    else:
-                        logging.error("FT Agent: Max restarts (%d) reached", max_restarts)
-                        sys.exit(returncode)
-
-            except Exception as e:  # pylint: disable=broad-exception-caught
+            except RuntimeError as e:
+                logging.error("FT Agent: %s", e)
+                sys.exit(1)
+            except OSError as e:
                 logging.error("FT Agent: Failed to start trainer: %s", e)
                 process_controller.clear_process()
                 if restart_count < max_restarts:
@@ -169,10 +243,10 @@ def run_ft_agent():
         monitor.stop()
 
 
-def main(_):
-    run_ft_agent()
+def main(argv):
+    # argv[0] is the program name; argv[1:] is everything after "--".
+    run_ft_agent(argv[1:])
 
 
 if __name__ == "__main__":
-    measurement.define_flags()
     app.run(main)

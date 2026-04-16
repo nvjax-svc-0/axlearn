@@ -7,6 +7,7 @@ from absl import flags
 from absl.testing import parameterized
 
 from axlearn.cloud.common.bundler import Bundler
+from axlearn.cloud.common.pod_mutator import PodMutator
 from axlearn.cloud.common.utils import define_flags, from_flags
 from axlearn.cloud.gcp import bundler, jobset_utils, lws_utils, pathways_utils
 from axlearn.cloud.gcp.bundler import CloudBuildBundler
@@ -155,12 +156,24 @@ class PathwaysReplicatedJobTest(TestCase):
                 }.issubset(env_vars)
             )
 
-            # Check security context for SYS_PTRACE capability
+            # Check resources
+            self.assertIn("resources", head_container)
+            resources = head_container["resources"]
+            self.assertEqual(resources["requests"]["cpu"], "1000.0m")
+            self.assertEqual(resources["requests"]["memory"], "16Gi")
+            self.assertEqual(resources["limits"]["cpu"], "1000.0m")
+            self.assertEqual(resources["limits"]["memory"], "16Gi")
+
+            # Check security context for privileged mode
             self.assertIn("securityContext", head_container)
             security_context = head_container["securityContext"]
-            self.assertIn("capabilities", security_context)
-            self.assertIn("add", security_context["capabilities"])
-            self.assertIn("SYS_PTRACE", security_context["capabilities"]["add"])
+            self.assertTrue(security_context["privileged"])
+
+            # Check safe-to-evict annotation
+            annotations = pod["metadata"]["annotations"]
+            self.assertEqual(
+                annotations.get("cluster-autoscaler.kubernetes.io/safe-to-evict"), "false"
+            )
 
             # Check pathways-proxy container args for XLA flags.
             proxy_container = None
@@ -242,6 +255,43 @@ class PathwaysReplicatedJobTest(TestCase):
             # MXLA flags are generally only present in multi-slice jobs.
             for flag in mxla_arg_flags:
                 self.assertIn(flag, worker_container["args"])
+
+    def test_pod_mutators_propagate_to_worker_pod(self):
+        """Tests that pod_mutators set on PathwaysReplicatedJob propagate to worker pods."""
+
+        class _TestMutator(PodMutator):
+            @pathways_utils.config_class
+            class Config(PodMutator.Config):
+                marker: str = ""
+
+            def mutate(self, job_spec, pod):
+                pod["metadata"]["annotations"]["test-mutator"] = self.config.marker
+                return pod
+
+        with self._job_config(CloudBuildBundler) as (cfg, bundler_cfg):
+            cfg.inner.set(
+                project="test-project",
+                name="test",
+                command="test_command",
+                output_dir="FAKE",
+            )
+            cfg.pod_mutators = [_TestMutator.default_config().set(marker="pw-marker")]
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+
+            # Verify propagation to inner _config.
+            # pylint: disable-next=protected-access
+            self.assertLen(builder._inner._config.pod_mutators, 1)
+
+            result = builder()
+            # Worker pod should have the mutator applied.
+            worker_job = next(r for r in result if "wk" in r["name"])
+            worker_pod = worker_job["template"]["spec"]["template"]
+            self.assertEqual(worker_pod["metadata"]["annotations"].get("test-mutator"), "pw-marker")
+
+            # Head pod should ALSO have the mutator applied.
+            head_job = next(r for r in result if "hd" in r["name"])
+            head_pod = head_job["template"]["spec"]["template"]
+            self.assertEqual(head_pod["metadata"]["annotations"].get("test-mutator"), "pw-marker")
 
     def test_replicated_job(self):
         with (
@@ -387,6 +437,10 @@ class PathwaysReplicatedJobTest(TestCase):
             pod_spec = pod["spec"]
             annotations = pod["metadata"]["annotations"]
 
+            # Verify safe-to-evict annotation
+            self.assertEqual(
+                annotations.get("cluster-autoscaler.kubernetes.io/safe-to-evict"), "false"
+            )
             # Verify gcsfuse annotations are set correctly
             self.assertEqual(annotations.get("gke-gcsfuse/volumes"), "true")
             self.assertIn("gke-gcsfuse/cpu-request", annotations)
@@ -431,14 +485,14 @@ class PathwaysMultiheadReplicatedJobTest(TestCase):
     def test_replicated_job(self, num_replicas, user_command_patcher):
         with (self._job_config(CloudBuildBundler, num_replicas) as (cfg, bundler_cfg),):
             command = "test_command"
+            if user_command_patcher:
+                cfg.set(user_command_patcher=user_command_patcher)
             cfg.inner.set(
                 project="test-project",
                 name="test",
                 command=command,
                 output_dir="FAKE",
             )
-            if user_command_patcher:
-                cfg.inner.set(user_command_patcher=user_command_patcher)
             cfg.instantiate(bundler=bundler_cfg.instantiate())
 
             builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
@@ -561,6 +615,12 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
 
             self.assertEqual(len(pod_spec["containers"]), 3)
 
+            # Check safe-to-evict annotation
+            annotations = pod["metadata"]["annotations"]
+            self.assertEqual(
+                annotations.get("cluster-autoscaler.kubernetes.io/safe-to-evict"), "false"
+            )
+
             proxy_container = None
             rm_container = None
             for container in pod_spec["containers"]:
@@ -599,8 +659,13 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
                 else _PATHWAYS_SERVER_IMAGE
             )
             self.assertEqual(container["image"], server_image)
-            num_args = 4 if _COLOCATED_PYTHON_SIDECAR_NAME in sidecars else 3
+            num_args = 6 if _COLOCATED_PYTHON_SIDECAR_NAME in sidecars else 5
             self.assertEqual(len(container["args"]), num_args)
+            self.assertIn("--tpu_pinned_host_allocation_recycle=true", container["args"])
+            premapped_buffer_args = [
+                a for a in container["args"] if a.startswith("--tpu_premapped_buffer_size=")
+            ]
+            self.assertLen(premapped_buffer_args, 1)
 
             expected_num_init_containers = 2 if _COLOCATED_PYTHON_SIDECAR_NAME in sidecars else 1
             self.assertEqual(expected_num_init_containers, len(pod_spec.get("initContainers", [])))
@@ -765,3 +830,151 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
                 self.assertEqual(len(pod_spec["containers"]), 3)
                 self.assertNotIn("notary-proxy", container_names)
                 self.assertNotIn("notary-proxy-grpc", container_names)
+
+    @parameterized.parameters([True, False])
+    def test_enable_telemetry_otel_sidecar(self, enable_telemetry):
+        """Tests that otel-sidecar container is added when enable_telemetry=True."""
+        with (
+            self._job_config(
+                CloudBuildBundler,
+                enable_telemetry=enable_telemetry,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="test-telemetry",
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = builder.build_leader_pod()
+            pod_spec = pod["spec"]
+
+            container_names = [c["name"] for c in pod_spec["containers"]]
+
+            # pathways-proxy and pathways-rm should always be present
+            self.assertIn(_PATHWAYS_PROXY_CONTAINER_NAME, container_names)
+            self.assertIn(_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME, container_names)
+
+            if enable_telemetry:
+                # When enable_telemetry=True, otel-sidecar should be present
+                self.assertIn("otel-sidecar", container_names)
+
+                # Check otel-sidecar container details
+                otel_sidecar = next(
+                    c for c in pod_spec["containers"] if c["name"] == "otel-sidecar"
+                )
+                self.assertEqual(otel_sidecar["image"], pathways_utils.OTEL_COLLECTOR_IMAGE)
+                # Check that both gRPC and HTTP ports are present
+                port_configs = {
+                    port["name"]: port["containerPort"] for port in otel_sidecar["ports"]
+                }
+                self.assertEqual(
+                    port_configs.get("otlp-grpc"), pathways_utils.OTEL_COLLECTOR_GRPC_PORT
+                )
+                self.assertEqual(
+                    port_configs.get("otlp-http"), pathways_utils.OTEL_COLLECTOR_HTTP_PORT
+                )
+
+                # Check otel-sidecar ConfigMap volume is present
+                volume_names = [v["name"] for v in pod_spec["volumes"]]
+                self.assertIn(pathways_utils.OTEL_COLLECTOR_CONFIG_NAME, volume_names)
+            else:
+                # When enable_telemetry=False, otel-sidecar should NOT be present
+                self.assertNotIn("otel-sidecar", container_names)
+
+    @parameterized.parameters(
+        (False, False),  # Neither flag enabled
+        (True, False),  # Only gke_gateway_route
+        (False, True),  # Only enable_telemetry
+        (True, True),  # Both flags enabled
+    )
+    def test_gke_gateway_route_and_telemetry_combination(self, gke_gateway_route, enable_telemetry):
+        """Tests correct container and volume configuration with different flag combinations."""
+        with (
+            self._job_config(
+                CloudBuildBundler,
+                gke_gateway_route=gke_gateway_route,
+                enable_telemetry=enable_telemetry,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="test-combo",
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = builder.build_leader_pod()
+            pod_spec = pod["spec"]
+
+            container_names = [c["name"] for c in pod_spec["containers"]]
+            volume_names = [v["name"] for v in pod_spec["volumes"]]
+
+            # Base containers always present
+            expected_count = 3  # head, pathways-proxy, pathways-rm
+
+            # Check notary-proxy containers
+            if gke_gateway_route:
+                expected_count += 2  # notary-proxy and notary-proxy-grpc
+                self.assertIn("notary-proxy", container_names)
+                self.assertIn("notary-proxy-grpc", container_names)
+            else:
+                self.assertNotIn("notary-proxy", container_names)
+                self.assertNotIn("notary-proxy-grpc", container_names)
+
+            # Check otel-sidecar
+            if enable_telemetry:
+                expected_count += 1  # otel-sidecar
+                self.assertIn("otel-sidecar", container_names)
+                self.assertIn(pathways_utils.OTEL_COLLECTOR_CONFIG_NAME, volume_names)
+            else:
+                self.assertNotIn("otel-sidecar", container_names)
+                self.assertNotIn(pathways_utils.OTEL_COLLECTOR_CONFIG_NAME, volume_names)
+
+            self.assertEqual(len(pod_spec["containers"]), expected_count)
+
+    @parameterized.parameters(
+        (False, "notary-proxy-config-sidecar", "notary-proxy-config-sidecar-grpc"),
+        (True, "notary-proxy-config-otl-sidecar", "notary-proxy-config-otl-sidecar-grpc"),
+    )
+    def test_configmap_switching_based_on_telemetry(
+        self, enable_telemetry, expected_http_cm, expected_grpc_cm
+    ):
+        """Tests that ConfigMap names change based on enable_telemetry flag."""
+        with (
+            self._job_config(
+                CloudBuildBundler,
+                gke_gateway_route=True,
+                enable_telemetry=enable_telemetry,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="test-configmap-switching",
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = builder.build_leader_pod()
+            pod_spec = pod["spec"]
+
+            # Check that correct ConfigMap volumes are used
+            volume_names = [v["name"] for v in pod_spec["volumes"]]
+            self.assertIn(expected_http_cm, volume_names)
+            self.assertIn(expected_grpc_cm, volume_names)
+
+            # Verify notary-proxy containers use the correct ConfigMap
+            notary_http = next(c for c in pod_spec["containers"] if c["name"] == "notary-proxy")
+            notary_grpc = next(
+                c for c in pod_spec["containers"] if c["name"] == "notary-proxy-grpc"
+            )
+
+            http_volume_mount = notary_http["volumeMounts"][0]["name"]
+            grpc_volume_mount = notary_grpc["volumeMounts"][0]["name"]
+
+            self.assertEqual(http_volume_mount, expected_http_cm)
+            self.assertEqual(grpc_volume_mount, expected_grpc_cm)

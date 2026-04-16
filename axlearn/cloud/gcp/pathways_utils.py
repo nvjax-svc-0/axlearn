@@ -4,6 +4,7 @@
 
 import copy
 import io
+import json
 import logging
 import os
 from typing import Any, Optional, Sequence, Union
@@ -24,6 +25,7 @@ from axlearn.cloud.gcp.jobset_utils import (
     BASTION_JOB_VERSION_LABEL,
     BaseReplicatedJob,
     FlagConfigurable,
+    TPUJobBuilder,
     TPUReplicatedJob,
     _LoadBalancer,
 )
@@ -65,6 +67,9 @@ _PATHWAYS_PROXY_IMAGE = (
 _PATHWAYS_SERVER_IMAGE = (
     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
 )
+# The colocated python sidecar is independent of the axlearn codebase.
+# No need to rebuild for every job launch.
+_COLOCATED_SIDECAR_IMAGE_TAG = "master-20260415"
 
 # With Jax >= 0.8.2, colocated images are the same as the standard
 # TODO(samuel-andersen): Rewrite pathways_utils.py to remove references to
@@ -97,15 +102,23 @@ _PATHWAYS_SHM_DIR = "/tmp/ifrt_proxy"
 _PATHWAYS_SHM_VOLUME_NAME = "shared-memory"
 
 # Notary proxy configuration for gke_gateway_route
-NOTARY_PROXY_IMAGE = "docker.apple.com/polymer/notary-proxy:44d03e27b8c9"
+NOTARY_PROXY_IMAGE = "REDACTED_INTERNAL_REGISTRY/polymer/notary-proxy:884a9a5f23ea"
 NOTARY_PROXY_HTTP_PORT = 38081
 NOTARY_PROXY_GRPC_PORT = 39001
 
+# OpenTelemetry collector image for enable_telemetry
+OTEL_COLLECTOR_IMAGE = "otel/opentelemetry-collector-contrib:0.144.0"
+OTEL_COLLECTOR_GRPC_PORT = 4317
+OTEL_COLLECTOR_HTTP_PORT = 4318
+OTEL_COLLECTOR_SIDECAR_NAME = "otel-sidecar"
+OTEL_COLLECTOR_CONFIG_NAME = "otel-sidecar-config"
+OTEL_COLLECTOR_CONFIG_MOUNT_PATH = "/conf"
+
 
 def get_colocated_python_image(image_id: str) -> str:
-    path, tag = image_id.rsplit(":", maxsplit=1)
+    path, _ = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
+    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
@@ -270,6 +283,77 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
         return self._enable_colocated_python
 
 
+def _build_base_pathways_worker_container(
+    *,
+    base_container_builder: TPUJobBuilder,
+    tpu_type: str,
+    colocated_python_plugin: PathwaysColocatedPythonPlugin,
+    resource_manager_address: str,
+) -> dict:
+    """Builds a base pathways worker container.
+
+    Args:
+        base_container_builder: The builder instance (a TPUJobBuilder subclass, e.g.,
+            TPUReplicatedJob or TPULeaderWorkerTemplate) that provides the base container
+            spec via `_build_container()`.
+        tpu_type: The TPU type string (e.g., "v4-8").
+        colocated_python_plugin: The colocated Python plugin instance.
+        resource_manager_address: The address used for --resource_manager_address arg.
+
+    Returns:
+        A dict corresponding to the worker container spec.
+    """
+    system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[tpu_type]
+    host_memory = GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS[system.gce_machine_type]
+    # pylint: disable-next=protected-access
+    container = base_container_builder._build_container()
+
+    worker_container = copy.deepcopy(container)
+    args = [
+        f"--server_port={_PATHWAYS_WORKER_PORT}",
+        f"--resource_manager_address={resource_manager_address}:"
+        + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+        f"--gcs_scratch_location={base_container_builder.config.output_dir}/pathways-staging",
+        # Recycling host memory gives a slight increase in performance.
+        "--tpu_pinned_host_allocation_recycle=true",
+    ]
+    if not colocated_python_plugin.is_colocated_python_enabled:
+        args.append(
+            # The flag below is needed for better H2D performance.
+            # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
+            # Note that pathways worker requires this flag to be a power of 2.
+            f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory//4)*(1<<30)}",
+        )
+    else:
+        # Colocated python uses more host memory.
+        # Thus we need to reduce the premapped buffer size.
+        premapped_buffer_size_gb = min(round_up_to_power_of_2(host_memory // 16), 32)
+        args.extend(
+            [
+                f"--tpu_premapped_buffer_size={premapped_buffer_size_gb * (1<<30)}",
+                f"--cloud_pathways_sidecar_shm_directory={_PATHWAYS_SHM_DIR}",
+            ]
+        )
+    worker_container["args"] = args
+
+    worker_container["image"] = colocated_python_plugin.pathways_server_image
+
+    ports = worker_container.get("ports", [])
+    ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
+    worker_container["ports"] = ports
+    if colocated_python_plugin.is_colocated_python_enabled:
+        worker_container["volumeMounts"] = [
+            dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR)
+        ]
+
+    # Command will be executed by the head node, and it will compile the model and
+    # distribute works to workers.
+    # So workers doesn't need to execute the command by themselves.
+    worker_container.pop("command")
+
+    return worker_container
+
+
 class PathwaysReplicatedJob(BaseReplicatedJob):
     """Builds a replicated jobspec for Pathways on TPU, to be used with JobSet API."""
 
@@ -337,6 +421,10 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         super().__init__(cfg, bundler=bundler)
         self._bundler = bundler
         self._inner: TPUReplicatedJob = cfg.inner.instantiate(bundler=self._bundler)
+        self._inner._user_command_patcher = self._user_command_patcher
+        # Propagate pod_mutators to inner so TPUJobBuilder._build_pod() applies them.
+        # Must set _config directly because self.config returns a deep copy.
+        self._inner._config.pod_mutators = cfg.pod_mutators
         self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
             raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
@@ -442,11 +530,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         mem_req = f"{self.config.pathways_head_mem}Gi"
         resources = {
             "requests": {"cpu": cpu_req, "memory": mem_req},
+            "limits": {"cpu": cpu_req, "memory": mem_req},
         }
         head_container["resources"] = resources
 
-        # This enables tracing tools like pyspy
-        head_container["securityContext"] = {"capabilities": {"add": ["SYS_PTRACE"]}}
+        head_container["securityContext"] = {"privileged": True}
 
         volume_mounts = head_container.get("volumeMounts", [])
         volume_mounts.append(dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR))
@@ -540,11 +628,13 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         cfg: TPUReplicatedJob.Config = self._inner.config
 
         annotations, labels, volumes, tolerations = {}, {}, [], []
+        annotations["axlearn/main-container"] = cfg.name
 
         if os.environ.get(BASTION_JOB_VERSION_ENV_VAR):
             labels.update({BASTION_JOB_VERSION_LABEL: os.environ.get(BASTION_JOB_VERSION_ENV_VAR)})
 
         volumes.append(dict(name="shared-output", emptyDir={}))
+        annotations.update({"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"})
         if cfg.gcsfuse_mount:
             self._inner.set_up_gcsfuse(cfg, volumes, annotations)
         else:
@@ -585,13 +675,22 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         if cfg.priority_class:
             head_pod_spec["priorityClassName"] = cfg.priority_class
 
-        return {
+        head_pod = {
             "metadata": {
                 "annotations": annotations,
                 "labels": labels,
             },
             "spec": head_pod_spec,
         }
+
+        job_spec = None
+        if raw := os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
+            job_spec = deserialize_jobspec(io.StringIO(raw))
+
+        for mutator in self._pod_mutators:
+            head_pod = mutator.mutate(job_spec, head_pod)
+
+        return head_pod
 
     def _build_pathways_head_job(self):
         logging.debug("Building a head job.")
@@ -617,19 +716,18 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         self, pathways_worker_replicated_job_index: Optional[int] = None
     ) -> dict:
         """Build the container for the 'pathways-worker' role."""
-        cfg: TPUReplicatedJob.Config = self._inner.config
-        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
-        host_memory = GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS[system.gce_machine_type]
-        # pylint: disable-next=protected-access
-        container = self._inner._build_container()
-
-        worker_container = copy.deepcopy(container)
-        env_list = worker_container.get("env", [])
-
         pathways_head_address = self._get_pathways_head_address(
             pathways_worker_replicated_job_index=pathways_worker_replicated_job_index
         )
 
+        worker_container = _build_base_pathways_worker_container(
+            base_container_builder=self._inner,
+            tpu_type=self._tpu_type,
+            colocated_python_plugin=self._colocated_python,
+            resource_manager_address=pathways_head_address,
+        )
+
+        env_list = worker_container.get("env", [])
         self._update_env_list(env_list, "MEGASCALE_COORDINATOR_ADDRESS", pathways_head_address)
 
         if self._is_single_head:
@@ -671,49 +769,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         worker_container["env"] = env_list
 
-        worker_container["args"] = [
-            f"--server_port={_PATHWAYS_WORKER_PORT}",
-            f"--resource_manager_address={pathways_head_address}:"
-            + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
-            f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
-            # Recycling host memory gives a slight increase in performance.
-            "--tpu_pinned_host_allocation_recycle=true",
-        ]
-        if not self._colocated_python.is_colocated_python_enabled:
-            worker_container["args"].append(
-                # The flag below is needed for better H2D performance.
-                # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
-                # Note that pathways worker requires this flag to be a power of 2.
-                f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory//4)*(1<<30)}",
-            )
-        else:
-            # Colocated python uses more host memory.
-            # Thus we need to reduce the premapped buffer size.
-            premapped_buffer_size_gb = min(round_up_to_power_of_2(host_memory // 16), 32)
-            worker_container["args"].extend(
-                [
-                    f"--tpu_premapped_buffer_size={premapped_buffer_size_gb * (1<<30)}",
-                    f"--cloud_pathways_sidecar_shm_directory={_PATHWAYS_SHM_DIR}",
-                ]
-            )
-
         mega_scale_args = xla_flags_from_options(self._mxla_options).split()
         worker_container["args"].extend(mega_scale_args)
-
-        worker_container["image"] = self._colocated_python.pathways_server_image
-
-        ports = worker_container.get("ports", [])
-        ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
-        worker_container["ports"] = ports
-        if self._colocated_python.is_colocated_python_enabled:
-            worker_container["volumeMounts"] = [
-                dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR)
-            ]
-
-        # Command will be executed by the head node, and it will compile the model and
-        # distribute works to workers.
-        # So workers doesn't need to execute the command by themselves.
-        worker_container.pop("command")
 
         return worker_container
 
@@ -830,6 +887,22 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         return replicated_jobs
 
+    def get_workload_labels(self) -> dict[str, str]:
+        inner_cfg: TPUReplicatedJob.Config = self._inner.config
+        if inner_cfg.enable_tpu_slice_auto_provisioning and inner_cfg.topology_assignment:
+            return {"tpu-provisioner.cloud.google.com/slice-autoprovisioning": "sync"}
+        return {}
+
+    def get_workload_annotations(self) -> dict[str, str]:
+        inner_cfg: TPUReplicatedJob.Config = self._inner.config
+        if inner_cfg.enable_tpu_slice_auto_provisioning and inner_cfg.topology_assignment:
+            return {
+                "tpu-provisioner.cloud.google.com/slice-selection": json.dumps(
+                    {_PATHWAYS_WORKER_REPLICATED_JOB_NAME: inner_cfg.topology_assignment}
+                )
+            }
+        return {}
+
 
 # TODO (ethanli): Consider refactoring with the modifiers pattern.
 class PathwaysMultiheadReplicatedJob(PathwaysReplicatedJob):
@@ -908,6 +981,19 @@ class PathwaysMultiheadReplicatedJob(PathwaysReplicatedJob):
 
         return replicated_jobs
 
+    def get_workload_annotations(self) -> dict[str, str]:
+        inner_cfg: TPUReplicatedJob.Config = self._inner.config
+        if not (inner_cfg.enable_tpu_slice_auto_provisioning and inner_cfg.topology_assignment):
+            return {}
+        # Each pwwk-N job gets exactly one slice assignment from the full topology list.
+        # inner_cfg.topology_assignment[i] is the subblock list for replica i.
+        slice_selection = {
+            f"{_PATHWAYS_WORKER_REPLICATED_JOB_NAME}-{i}": [inner_cfg.topology_assignment[i]]
+            for i in range(inner_cfg.accelerator.num_replicas)
+            if i < len(inner_cfg.topology_assignment)
+        }
+        return {"tpu-provisioner.cloud.google.com/slice-selection": json.dumps(slice_selection)}
+
 
 class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
     """Builds a LeaderWorkerTemplate spec for TPUs"""
@@ -934,6 +1020,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         enable_service: bool = None
         gke_gateway_route: bool = None
         enable_health_probes: Optional[bool] = None
+        enable_telemetry: bool = None
 
         # Health probe configuration for inference pods.
         # - startup_probe_failure_threshold: Max consecutive failures before probe fails.
@@ -997,6 +1084,12 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             "Enable express route with notary-proxy sidecars for direct gateway routing",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "enable_telemetry",
+            False,
+            "Enable telemetry with otel-sidecar for sending metrics to Otel collector",
+            **common_kwargs,
+        )
         flags.DEFINE_integer(
             "startup_probe_failure_threshold",
             360,
@@ -1027,6 +1120,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         fv.set_default("enable_service", fv.enable_service or False)
         fv.set_default("gke_gateway_route", fv.gke_gateway_route or False)
         fv.set_default("enable_health_probes", fv.enable_health_probes or False)
+        fv.set_default("enable_telemetry", fv.enable_telemetry or False)
 
     @classmethod
     def default_config(cls):
@@ -1043,6 +1137,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         self._bundler = bundler
         self._inner: TPULeaderWorkerTemplate = cfg.inner.instantiate(bundler=self._bundler)
         self._inner._user_command_patcher = self._user_command_patcher
+        # Propagate pod_mutators to inner so TPUJobBuilder._build_pod() applies them.
+        # Must set _config directly because self.config returns a deep copy.
+        self._inner._config.pod_mutators = cfg.pod_mutators
 
         self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
@@ -1051,31 +1148,12 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         self._colocated_python = cfg.colocated_python.instantiate(bundler=bundler)
 
     def _build_pathways_worker_container(self) -> dict:
-        cfg: TPULeaderWorkerTemplate.Config = self.config
-        # pylint: disable-next=protected-access
-        container = self._inner._build_container()
-
-        worker_container = copy.deepcopy(container)
-        args = [
-            f"--server_port={_PATHWAYS_WORKER_PORT}",
-            "--resource_manager_address=$(LWS_LEADER_ADDRESS):"
-            + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
-            f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
-        ]
-        if self._colocated_python.is_colocated_python_enabled:
-            args.append(f"--cloud_pathways_sidecar_shm_directory={_PATHWAYS_SHM_DIR}")
-        worker_container["args"] = args
-        ports = worker_container.get("ports", [])
-        ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
-        worker_container["ports"] = ports
-        worker_container["image"] = self._colocated_python.pathways_server_image
-        if self._colocated_python.is_colocated_python_enabled:
-            worker_container["volumeMounts"] = [
-                dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR)
-            ]
-
-        worker_container.pop("command")
-        return worker_container
+        return _build_base_pathways_worker_container(
+            base_container_builder=self._inner,
+            tpu_type=self._tpu_type,
+            colocated_python_plugin=self._colocated_python,
+            resource_manager_address="$(LWS_LEADER_ADDRESS)",
+        )
 
     def build_worker_pod(self) -> dict:
         # pylint: disable-next=protected-access
@@ -1164,6 +1242,28 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
         )
 
+    def _get_notary_configmap_name(self, config_type: str) -> str:
+        """Returns the appropriate ConfigMap name based on telemetry setting.
+
+        Args:
+            config_type: Either "http" or "grpc"
+
+        Returns:
+            ConfigMap name
+        """
+        cfg: PathwaysLeaderWorkerTemplate.Config = self.config
+
+        if cfg.enable_telemetry:
+            if config_type == "http":
+                return "notary-proxy-config-otl-sidecar"
+            else:  # grpc
+                return "notary-proxy-config-otl-sidecar-grpc"
+        else:
+            if config_type == "http":
+                return "notary-proxy-config-sidecar"
+            else:  # grpc
+                return "notary-proxy-config-sidecar-grpc"
+
     def _build_notary_sidecar_containers(self) -> list[Nested[Any]]:
         """Builds notary-proxy sidecar containers for gke_gateway_route.
 
@@ -1221,7 +1321,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             },
             "volumeMounts": [
                 {
-                    "name": "notary-proxy-config-sidecar",
+                    "name": self._get_notary_configmap_name("http"),
                     "mountPath": "/app/configs/notary-proxy.yml",
                     "subPath": "notary-proxy.yml",
                 }
@@ -1252,7 +1352,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             },
             "volumeMounts": [
                 {
-                    "name": "notary-proxy-config-sidecar-grpc",
+                    "name": self._get_notary_configmap_name("grpc"),
                     "mountPath": "/app/configs/notary-proxy.yml",
                     "subPath": "notary-proxy.yml",
                 }
@@ -1262,6 +1362,56 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         containers.append(grpc_container)
 
         return containers
+
+    def _build_otel_sidecar_container(self) -> dict:
+        """Builds otel-sidecar container for telemetry.
+
+        Returns:
+            A dict corresponding to the otel-sidecar container spec.
+        """
+        cfg: TPULeaderWorkerTemplate.Config = self._inner.config
+
+        return {
+            "name": OTEL_COLLECTOR_SIDECAR_NAME,
+            "image": OTEL_COLLECTOR_IMAGE,
+            "args": [f"--config={OTEL_COLLECTOR_CONFIG_MOUNT_PATH}/otel-collector-config.yaml"],
+            "env": [
+                {"name": "LWS_NAME", "value": cfg.name},
+                {
+                    "name": "POD_NAME",
+                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                },
+                {
+                    "name": "NAMESPACE",
+                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
+                },
+            ],
+            "ports": [
+                {"name": "otlp-grpc", "containerPort": OTEL_COLLECTOR_GRPC_PORT, "protocol": "TCP"},
+                {"name": "otlp-http", "containerPort": OTEL_COLLECTOR_HTTP_PORT, "protocol": "TCP"},
+            ],
+            "volumeMounts": [
+                {"name": OTEL_COLLECTOR_CONFIG_NAME, "mountPath": OTEL_COLLECTOR_CONFIG_MOUNT_PATH}
+            ],
+            "resources": {
+                "requests": {"cpu": "200m", "memory": "256Mi"},
+                "limits": {"cpu": "1000m", "memory": "512Mi"},
+            },
+            "readinessProbe": {
+                "httpGet": {"path": "/", "port": 13133},
+                "initialDelaySeconds": 5,
+                "periodSeconds": 10,
+                "timeoutSeconds": 5,
+                "failureThreshold": 3,
+            },
+            "livenessProbe": {
+                "httpGet": {"path": "/", "port": 13133},
+                "initialDelaySeconds": 30,
+                "periodSeconds": 15,
+                "timeoutSeconds": 5,
+                "failureThreshold": 5,
+            },
+        }
 
     def _build_head_container(self) -> dict:
         cfg: PathwaysLeaderWorkerTemplate.Config = self.config
@@ -1274,22 +1424,26 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         }
         command = inner_cfg.command
 
+        spec = None
+        if job_spec := os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
+            try:
+                spec = deserialize_jobspec(io.StringIO(job_spec))
+            except ValidationError:
+                logging.debug("Failed to deserialize job spec.")
+
         if self._user_command_patcher is not None:
             user_id = None
-            job_spec = os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR)
-            if job_spec:
-                try:
-                    spec = deserialize_jobspec(io.StringIO(job_spec))
-                    user_id = spec.metadata.user_id
-                except ValidationError:
-                    logging.debug("Failed to deserialize job spec for user command patching.")
+            if spec:
+                user_id = spec.metadata.user_id
             command = self._user_command_patcher.patch(command, user_id=user_id)
+
+        if spec and spec.code_asset_path:
+            command = f"{self._bundler.install_command(spec.code_asset_path)} && {command}"
 
         container = dict(
             name=inner_cfg.name,
             image=inner_cfg.image_id or self._bundler.id(inner_cfg.name),
-            # This enables tracing tools like pyspy
-            securityContext={"capabilities": {"add": ["SYS_PTRACE"]}},
+            securityContext={"privileged": True},
             command=["bash", "-c", command],
             env=[
                 {
@@ -1353,6 +1507,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         cfg: TPUReplicatedJob.Config = self._inner.config
 
         annotations, labels, volumes, tolerations = {}, {}, [], []
+        annotations["axlearn/main-container"] = cfg.name
 
         if os.environ.get(BASTION_JOB_VERSION_ENV_VAR):
             labels.update({BASTION_JOB_VERSION_LABEL: os.environ.get(BASTION_JOB_VERSION_ENV_VAR)})
@@ -1360,6 +1515,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         volumes.append(dict(name="shared-output", emptyDir={}))
         labels = {"app": cfg.name}
 
+        annotations.update({"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"})
         if cfg.gcsfuse_mount:
             annotations.update(
                 {
@@ -1383,17 +1539,31 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         # Add notary-proxy sidecars when gke_gateway_route is enabled
         if self.config.gke_gateway_route:
             containers.extend(self._build_notary_sidecar_containers())
-            # Add ConfigMap volumes for notary-proxy
+            # Add ConfigMap volumes for notary-proxy (names change based on telemetry)
+            http_cm_name = self._get_notary_configmap_name("http")
+            grpc_cm_name = self._get_notary_configmap_name("grpc")
+
             volumes.append(
                 dict(
-                    name="notary-proxy-config-sidecar",
-                    configMap=dict(name="notary-proxy-config-sidecar"),
+                    name=http_cm_name,
+                    configMap=dict(name=http_cm_name),
                 )
             )
             volumes.append(
                 dict(
-                    name="notary-proxy-config-sidecar-grpc",
-                    configMap=dict(name="notary-proxy-config-sidecar-grpc"),
+                    name=grpc_cm_name,
+                    configMap=dict(name=grpc_cm_name),
+                )
+            )
+
+        # Add otel-sidecar when telemetry is enabled
+        if self.config.enable_telemetry:
+            containers.append(self._build_otel_sidecar_container())
+            # Add otel-sidecar ConfigMap volume
+            volumes.append(
+                dict(
+                    name=OTEL_COLLECTOR_CONFIG_NAME,
+                    configMap=dict(name=OTEL_COLLECTOR_CONFIG_NAME),
                 )
             )
 
@@ -1416,13 +1586,22 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         if cfg.priority_class:
             leader_pod_spec["priorityClassName"] = cfg.priority_class
 
-        return {
+        leader_pod = {
             "metadata": {
                 "annotations": annotations,
                 "labels": labels,
             },
             "spec": leader_pod_spec,
         }
+
+        job_spec = None
+        if raw := os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
+            job_spec = deserialize_jobspec(io.StringIO(raw))
+
+        for mutator in self._pod_mutators:
+            leader_pod = mutator.mutate(job_spec, leader_pod)
+
+        return leader_pod
 
     def __call__(self) -> Nested[Any]:  # pytype: disable=signature-mismatch
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
@@ -1435,3 +1614,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             leaderTemplate=self.build_leader_pod(),
             workerTemplate=self.build_worker_pod(),
         )
+
+    def get_workload_labels(self) -> dict[str, str]:
+        return self._inner.get_workload_labels()
+
+    def get_workload_annotations(self) -> dict[str, str]:
+        return self._inner.get_workload_annotations()

@@ -18,6 +18,7 @@ https://github.com/google/jax/blob/595a620804e810335a870e93975a78504b2e95e5/jax/
 """
 import asyncio
 import functools
+import gc
 import math
 import os
 import threading
@@ -35,9 +36,100 @@ import tensorstore as ts
 from absl import logging
 from jax._src import array, typing
 from jax._src.layout import Format
+from jax._src.mesh import thread_resources
+from jax.experimental import colocated_python
 from jax.experimental.array_serialization import serialization
 
 from axlearn.common.utils import Tensor
+
+# Maximum number of concurrent device_put (CPU→TPU) transfers during colocated checkpoint loading.
+# Concurrent device_put calls can deadlock in Pathways; reported to the Pathways team.
+# Limiting to 1 unblocks production with minimal impact since each H2D transfer finishes under 1ms.
+_COLOCATED_H2D_CONCURRENCY = 1
+
+# Timeout (in seconds) for the block_until_ready + H2D transfer step in the colocated
+# deserialization pipeline.  If this fires, it almost certainly indicates a hang.
+# We crash so the pathways head can restart the process with a clean lock state.
+_COLOCATED_TRANSFER_TIMEOUT_SECS = 600  # 10 minutes
+
+
+@colocated_python.colocated_python_class
+class _ColocatedStateManager:
+    """Manages config and runtime resources on colocated sidecar.
+
+    __init__ args are pickled and transferred from controller.
+    __init__ runs on the sidecar creating ts_context and event_loop.
+    """
+
+    def __init__(
+        self,
+        cpu_shardings: Sequence[jax.sharding.Sharding],
+        tensorstore_specs: Sequence[dict[str, Any]],
+        global_shapes: Sequence[tuple],
+        dtypes: Sequence[typing.DTypeLike],
+        concurrent_bytes: int,
+    ):
+        # Configurations set from controller.
+        self.cpu_shardings = cpu_shardings
+        self.tensorstore_specs = tensorstore_specs
+        self.global_shapes = global_shapes
+        self.dtypes = dtypes
+        self.concurrent_bytes = concurrent_bytes
+
+        # Runtime resources created on sidecar.
+        self.ts_context = ts.Context(serialization.TS_CONTEXT.spec)
+        self.event_loop = asyncio.new_event_loop()
+        self.event_loop.set_default_executor(futures.ThreadPoolExecutor(max_workers=os.cpu_count()))
+        self.loop_thread = threading.Thread(target=self.event_loop.run_forever, daemon=True)
+        self.loop_thread.start()
+        logging.info("ColocatedStateManager initialized on sidecar.")
+
+    def load_to_cpu(self, idx: jax.Array):
+        """Load a single array to CPU on the sidecar."""
+        i = int(idx)
+        # pylint: disable=protected-access
+        byte_limiter = serialization._LimitInFlightBytes(self.concurrent_bytes)
+        return asyncio.run_coroutine_threadsafe(
+            _async_deserialize(
+                self.cpu_shardings[i],
+                self.tensorstore_specs[i],
+                self.global_shapes[i],
+                self.dtypes[i],
+                byte_limiter=byte_limiter,
+                h2d_limiter=None,
+                single_thread_pool=None,
+                multi_thread_pool=None,
+                ts_context=self.ts_context,
+            ),
+            self.event_loop,
+        ).result()
+
+    def teardown(self):
+        """Release TensorStore context and event loop on colocated Python workers."""
+        if hasattr(self, "event_loop") and self.event_loop is not None:
+            # Shut down the default executor before stopping the loop (1 min timeout).
+            asyncio.run_coroutine_threadsafe(
+                self.event_loop.shutdown_default_executor(
+                    timeout=60
+                ),  # pytype: disable=wrong-keyword-args
+                self.event_loop,
+            ).result()
+            self.event_loop.call_soon_threadsafe(self.event_loop.stop)
+            self.loop_thread.join()
+            self.event_loop.close()
+            self.event_loop = None
+        self.ts_context = None
+        logging.info("ColocatedStateManager destroyed on sidecar.")
+
+    def __del__(self):
+        self.teardown()
+
+
+@colocated_python.colocated_python
+def _colocated_teardown():
+    """Run garbage collection on the sidecar."""
+    gc.collect()
+    logging.info("Colocated teardown complete. Live objects: %d", len(gc.get_objects()))
 
 
 @dataclass
@@ -402,8 +494,38 @@ async def _run_serializer(
         raise e
 
 
-def _blocking_device_put(out: Tensor, layout: Format) -> Tensor:
-    return jax.block_until_ready(jax.device_put(out, layout))
+def _blocking_device_put(tensor: Tensor, target: Union[Format, jax.sharding.Sharding]) -> Tensor:
+    """Device put and block until ready.
+
+    Args:
+        tensor: Array to transfer.
+        target: Either a Format (with layout + sharding) or Sharding.
+
+    Returns:
+        Transferred array.
+    """
+    return jax.block_until_ready(jax.device_put(tensor, target))
+
+
+def _wait_host_array_h2d_transfer(
+    cpu_array: Tensor,
+    target: Union[Format, jax.sharding.Sharding],
+) -> Tensor:
+    """Wait for CPU array to be ready and transfer to device in a single call.
+
+    Merging block_until_ready and device_put into one function reduces the number of
+    GIL acquire/release cycles when submitted via run_in_executor, lowering the chance
+    of GIL-vs-C++-mutex deadlocks.
+
+    Args:
+        cpu_array: Array on CPU that may still be materializing.
+        target: Either a Format (with layout + sharding) or Sharding.
+
+    Returns:
+        Transferred array on the target device.
+    """
+    cpu_array.block_until_ready()
+    return jax.block_until_ready(jax.device_put(cpu_array, target))
 
 
 async def _async_deserialize(
@@ -412,10 +534,11 @@ async def _async_deserialize(
     global_shape: Optional[Sequence[int]],
     dtype: Optional[typing.DTypeLike],
     *,
-    h2d_limiter: serialization._LimitInFlightBytes,
+    h2d_limiter: Optional[serialization._LimitInFlightBytes],
     byte_limiter: serialization._LimitInFlightBytes,
-    single_thread_pool: ThreadPoolExecutor,
-    multi_thread_pool: ThreadPoolExecutor,
+    single_thread_pool: Optional[ThreadPoolExecutor],
+    multi_thread_pool: Optional[ThreadPoolExecutor],
+    ts_context: Optional[ts.Context] = None,
 ):
     """Modified from
     https://github.com/jax-ml/jax/blob/e7ec418eba9ada336f755613948cbdf4a9e97d59/jax/experimental/array_serialization/serialization.py#L345
@@ -432,6 +555,9 @@ async def _async_deserialize(
        in flight H2D is imposed. Note that Pathways checkpoint loading does not require h2d limiter
        since the H2D doesn't happen in the head node, and each worker has preemapped a chunk of host
        memory that is larger than the total device memory.
+       h2d_limiter, single_thread_pool, and multi_thread_pool are all optional. When omitted (e.g.
+       in the colocated Python path where a global pipeline limiter already bounds concurrency),
+       H2D is submitted to the default asyncio thread pool without per-shard gating.
     4. Let user pass in a multi_thread_pool thread pool for ckpt loading, instead of letting async
        io to create a default pool, to make it more configurable.
 
@@ -469,9 +595,13 @@ async def _async_deserialize(
     #   - On AWS (or other non-GCP environments) accessing GCS, gcs_grpc may hit auth/network
     #     issues due to cross-cloud constraints. So we enable this optimization on Pathways
     #     which only runs on GCP for now.
-    context = serialization.TS_CONTEXT
+    context = ts_context or serialization.TS_CONTEXT
+
     if os.getenv("ENABLE_GCS_GRPC", "false") == "true":
+        logging.debug("gcs_grpc enabled")
         tensorstore_spec, context = use_gcs_grpc(tensorstore_spec)
+    else:
+        logging.debug("gcs_grpc not enabled")
 
     t = await ts.open(
         tensorstore_spec,
@@ -528,10 +658,14 @@ async def _async_deserialize(
             dll, jax.sharding.SingleDeviceSharding(device, memory_kind=in_sharding.memory_kind)
         )
 
+        if h2d_limiter is None:
+            # No per-shard H2D gating — caller (e.g. colocated Python path) relies on a global
+            # pipeline limiter to bound concurrency instead.
+            result = await loop.run_in_executor(None, _blocking_device_put, out, layout)
         # Jax >= 0.6.2 changes the behavior of _LimitInFlightBytes, where wait_for_bytes no longer
         # throws an exception if requested_bytes > max_bytes
         # pylint: disable-next=protected-access
-        if out_size > h2d_limiter._max_bytes:
+        elif out_size > h2d_limiter._max_bytes:
             logging.log_first_n(
                 logging.WARNING,
                 "Tensor shard for tensor %s (padded size %d bytes) exceeded "
@@ -567,6 +701,257 @@ async def _async_deserialize(
     return await serialization.ts_impl._create_async_array_from_callback(
         shape, dtype, in_sharding, cb
     )
+
+
+def _create_cpu_shardings(
+    cpu_devices: list,
+    tpu_shardings: Sequence[Union[jax.sharding.Sharding, Format]],
+    tpu_mesh: jax.sharding.Mesh,
+) -> list[jax.sharding.Sharding]:
+    """Create CPU shardings that mirror the structure of TPU shardings.
+
+    Args:
+        cpu_devices: List of CPU devices.
+        tpu_shardings: Target TPU shardings to mirror.
+        tpu_mesh: TPU mesh for creating multi-device CPU mesh.
+
+    Returns:
+        List of CPU shardings matching the TPU sharding structure.
+    """
+    if len(cpu_devices) > 1:
+        logging.info("Creating CPU mesh from TPU mesh: %s", tpu_mesh)
+        cpu_mesh = colocated_python.colocated_cpu_devices(tpu_mesh)
+        logging.info("CPU Mesh: %s", cpu_mesh)
+
+        return [
+            (
+                jax.sharding.NamedSharding(cpu_mesh, sharding.spec)
+                if isinstance(sharding, jax.sharding.NamedSharding)
+                else jax.sharding.NamedSharding(cpu_mesh, jax.sharding.PartitionSpec())
+            )
+            for sharding in tpu_shardings
+        ]
+    else:
+        # Single device - use simple single device sharding
+        return [jax.sharding.SingleDeviceSharding(cpu_devices[0]) for _ in tpu_shardings]
+
+
+async def _effective_bytes_per_device(
+    spec: dict[str, Any],
+    shape: tuple,
+    dtype: typing.DTypeLike,
+    sharding: jax.sharding.Sharding,
+) -> int:
+    """Estimates effective bytes read from storage per device, accounting for chunk overhead.
+
+    TensorStore reads whole chunks even if only a partial chunk is needed, so actual bytes
+    read can exceed the raw tensor shard size.
+    """
+    t = await ts.open(ts.Spec(spec), open=True, context=serialization.TS_CONTEXT)
+    shard_shape = sharding.shard_shape(shape)
+    raw_bytes = math.prod(shard_shape) * np.dtype(dtype).itemsize
+
+    read_chunk = t.chunk_layout.read_chunk
+    if read_chunk is None or read_chunk.shape is None:
+        return raw_bytes
+
+    chunk_shape = read_chunk.shape
+    overhead_ratio = 1.0
+    for dim_idx in range(len(shape)):
+        cs = chunk_shape[dim_idx]
+        needed = shard_shape[dim_idx]
+        if needed > 0:
+            num_chunks = (needed + cs - 1) // cs
+            overhead_ratio *= (num_chunks * cs) / needed
+
+    return int(raw_bytes * overhead_ratio)
+
+
+async def _run_colocated_deserialize(
+    shardings: Sequence[Union[jax.sharding.Sharding, Format]],
+    tensorstore_specs: Sequence[dict[str, Any]],
+    global_shapes: Sequence[tuple],
+    dtypes: Sequence[typing.DTypeLike],
+    *,
+    concurrent_bytes: int,
+    tpu_mesh: jax.sharding.Mesh,
+    pipeline_concurrent_bytes: int,
+    multi_thread_pool: ThreadPoolExecutor,
+):
+    """Deserialize checkpoint with pipelined load to CPU then transfer to TPU.
+
+    This approach uses colocated Python to load checkpoint data to CPU worker, then
+    transfers each array to TPU. A global limiter controls the entire pipeline (load + transfer)
+    to keep CPU memory usage bounded.
+
+    Args:
+        shardings: Target TPU shardings for the restored arrays.
+        tensorstore_specs: TensorStore specifications for each array.
+        global_shapes: Global shapes for each array.
+        dtypes: Data types for each array.
+        concurrent_bytes: Maximum concurrent bytes for reading from storage (used by worker).
+        tpu_mesh: TPU mesh for creating CPU mesh. Should be captured from the main thread
+            where the mesh context is active.
+        pipeline_concurrent_bytes: Maximum concurrent bytes for the entire pipeline.
+            Controls peak CPU memory usage.
+        multi_thread_pool: Thread pool for blocking operations (block_until_ready, TPU transfer).
+
+    Returns:
+        List of JAX arrays on TPU devices.
+    """
+    cpu_devices = colocated_python.colocated_cpu_devices(jax.devices())
+    logging.info("Colocated CPU devices: %s", cpu_devices)
+
+    # Create CPU shardings matching the TPU sharding structure
+    cpu_shardings = _create_cpu_shardings(cpu_devices, shardings, tpu_mesh)
+
+    # Pre-compute effective per-device bytes in parallel across all arrays.
+    effective_bytes = list(
+        await asyncio.gather(
+            *[
+                _effective_bytes_per_device(
+                    tensorstore_specs[i],
+                    global_shapes[i],
+                    dtypes[i],
+                    cpu_sharding,
+                )
+                for i, cpu_sharding in enumerate(cpu_shardings)
+            ]
+        )
+    )
+
+    # Global limiter controls the entire pipeline (load + transfer)
+    # This limits total bytes in flight across all arrays
+    # pylint: disable=protected-access
+    global_limiter = serialization._LimitInFlightBytes(pipeline_concurrent_bytes)
+
+    logging.info(
+        "Created global pipeline limiter with %.1fGB capacity",
+        pipeline_concurrent_bytes / (10**9),
+    )
+
+    # Create _ColocatedStateManager on the sidecar, which initializes runtime resources
+    # (__init__ runs on sidecar) and stores config alongside them.
+    colocated_mgr = _ColocatedStateManager(
+        cpu_shardings, tensorstore_specs, global_shapes, dtypes, concurrent_bytes
+    )
+
+    # Pre-create replicated index arrays across all cpu_devices. colocated_python requires inputs
+    # to have one shard per device in the specialized device list.
+    cpu_mesh = colocated_python.colocated_cpu_devices(tpu_mesh)
+    replicated_sharding = jax.sharding.NamedSharding(cpu_mesh, jax.sharding.PartitionSpec())
+    idx_arrays = [jax.device_put(jnp.array(i), replicated_sharding) for i in range(len(shardings))]
+
+    # Limit concurrent device_put calls to avoid a Pathways deadlock
+    # (see _COLOCATED_H2D_CONCURRENCY).
+    h2d_semaphore = asyncio.Semaphore(_COLOCATED_H2D_CONCURRENCY)
+
+    async def _load_and_transfer_one(
+        idx: int,
+        tpu_sharding: jax.sharding.Sharding,
+        dispatch_pool: ThreadPoolExecutor,
+    ):
+        """Load one array to CPU via colocated Python, then transfer to TPU."""
+        logging.info("Array %d: [3/7] start colocated python dispatch.", idx)
+        specialized = colocated_mgr.load_to_cpu.specialize(  # pytype: disable=name-error
+            devices=cpu_devices,
+            out_specs_fn=lambda _: jax.ShapeDtypeStruct(
+                shape=global_shapes[idx], dtype=dtypes[idx], sharding=cpu_shardings[idx]
+            ),
+        )
+        loop = asyncio.get_running_loop()
+        # Each call dispatched from a separate thread enables concurrent sidecar execution.
+        # Colocated_python only supports jax.Array as inputs, so we pass a scalar index array
+        # and look up the per-array data inside colocated_mgr.load_to_cpu.
+        cpu_array = await loop.run_in_executor(dispatch_pool, specialized, idx_arrays[idx])
+        logging.info("Array %d: [4/7] colocated python returned.", idx)
+        async with h2d_semaphore:
+            logging.info("Array %d: [5/7] h2d begin.", idx)
+            try:
+                tpu_array = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        multi_thread_pool,
+                        _wait_host_array_h2d_transfer,
+                        cpu_array,
+                        tpu_sharding,
+                    ),
+                    timeout=_COLOCATED_TRANSFER_TIMEOUT_SECS,
+                )
+            except asyncio.TimeoutError:
+                # Use logging.error instead of logging.fatal because fatal calls sys.exit,
+                # which could hang during cleanup if threads are deadlocked.
+                logging.error(
+                    "Array %d (shape=%s, dtype=%s): block_until_ready + H2D transfer "
+                    "timed out after %ds. Force-exiting process.",
+                    idx,
+                    global_shapes[idx],
+                    dtypes[idx],
+                    _COLOCATED_TRANSFER_TIMEOUT_SECS,
+                )
+                # A timeout detects deadlocks, when it happens, we let the job crash and restart.
+                # We do not retry because the timed-out thread cannot be cancelled.
+                os._exit(1)
+        logging.info("Array %d: [6/7] h2d done.", idx)
+        # Explicitly release the CPU buffer once H2D transfer is complete.
+        # This is for deterministic memory release within colocated-python sidecar container.
+        del cpu_array
+        return tpu_array
+
+    async def _load_and_transfer_one_rate_limited(
+        idx: int,
+        tpu_sharding: jax.sharding.Sharding,
+        dispatch_pool: ThreadPoolExecutor,
+    ):
+        """Wrapper that applies global limiter to the entire load+transfer operation."""
+        logging.info("Array %d: [1/7] begin.", idx)
+        bytes_per_device = effective_bytes[idx]
+        # pylint: disable-next=protected-access
+        max_capacity = global_limiter._max_bytes
+
+        # Clamp to limiter capacity so oversized arrays don't deadlock wait_for_bytes.
+        if bytes_per_device > max_capacity:
+            logging.warning(
+                "Array shard size per device (%.2f GB) exceeded "
+                "limiter capacity (%.2f GB). Clamping reservation.",
+                bytes_per_device / (1024**3),
+                max_capacity / (1024**3),
+            )
+        bytes_to_reserve = min(bytes_per_device, max_capacity)
+
+        await global_limiter.wait_for_bytes(bytes_to_reserve)
+        logging.info("Array %d: [2/7] limiter acquired.", idx)
+        try:
+            return await _load_and_transfer_one(idx, tpu_sharding, dispatch_pool)
+        finally:
+            await global_limiter.release_bytes(bytes_to_reserve)
+            logging.info("Array %d: [7/7] fully completed.", idx)
+
+    # Dedicated pool for colocated_python dispatch. colocated_python only executes calls
+    # concurrently when dispatched from different threads — a separate pool ensures dispatch
+    # threads are never starved by blocking work (block_until_ready, TPU transfer) on
+    # multi_thread_pool.
+    with ThreadPoolExecutor(max_workers=min(len(shardings), 256)) as dispatch_pool:
+        tasks = [
+            _load_and_transfer_one_rate_limited(idx, tpu_sharding, dispatch_pool)
+            for idx, tpu_sharding in enumerate(shardings)
+        ]
+
+        logging.info("Starting pipelined colocated load and transfer...")
+        start_time = time.perf_counter()
+        tpu_arrays = await asyncio.gather(*tasks)
+
+    total_time = time.perf_counter() - start_time
+    logging.info("Pipelined colocated deserialization completed in %.2f seconds", total_time)
+
+    # Deterministically release event loop and executor on the sidecar.
+    colocated_mgr.teardown.specialize(devices=cpu_devices)()
+    # Explicitly trigger GC to ensure deterministic memory release within the
+    # colocated-python sidecar container.
+    gc.collect()
+    # Run gc.collect() and log diagnostics on the sidecar.
+    _colocated_teardown.specialize(devices=cpu_devices)()
+
+    return tpu_arrays
 
 
 # Reference:
@@ -678,34 +1063,102 @@ class GlobalAsyncCheckpointManager(serialization.GlobalAsyncCheckpointManager):
         dtypes: Optional[Sequence[typing.DTypeLike]] = None,
         concurrent_gb: int = 32,
     ):
+        """Deserialize arrays from TensorStore.
+
+        Args:
+            shardings: Sharding specifications for each array.
+            tensorstore_specs: TensorStore specifications for each array.
+            global_shapes: Global shapes for each array. If None, uses shape from TensorStore.
+            dtypes: Data types for each array. If None, uses dtype from TensorStore.
+            concurrent_gb: Maximum concurrent GB for reading from storage.
+
+        Returns:
+            List of deserialized JAX arrays.
+
+        Environment variables:
+            COLOCATED_PYTHON_DESERIALIZE: Set to "1" or "true" (case insensitive) to
+                enable colocated Python deserialization. Defaults to disabled.
+            COLOCATED_PYTHON_PIPELINE_CONCURRENT_GB: Maximum concurrent GB in flight during
+                CPU to TPU transfer when using colocated Python. Defaults to 32.
+        """
         self.wait_until_finished()
         start_time = time.perf_counter()
 
+        use_colocated_python = running_on_pathways() and (
+            os.getenv("COLOCATED_PYTHON_DESERIALIZE", "").lower() in ("1", "true")
+        )
+        logging.info("use_colocated_python=%s", use_colocated_python)
+
         concurrent_bytes = concurrent_gb * 10**9
 
-        async def _run_deserializer():
-            # Object should be created once per process.
-            # pylint: disable=protected-access
-            byte_limiter = serialization._LimitInFlightBytes(concurrent_bytes)
-            h2d_limiter = serialization._LimitInFlightBytes(_get_premapped_buffer_size())
+        # Prepare global shapes and dtypes
+        global_shapes_list = (
+            [None] * len(tensorstore_specs)
+            if global_shapes is None
+            else [tuple(s) for s in global_shapes]
+        )
+        dtypes_list = [None] * len(tensorstore_specs) if dtypes is None else list(dtypes)
 
-            future_arrays = jax.tree.map(
-                functools.partial(
-                    _async_deserialize,
-                    byte_limiter=byte_limiter,
-                    h2d_limiter=h2d_limiter,
-                    single_thread_pool=self._single_thread_pool,
-                    multi_thread_pool=self._multi_thread_pool,
-                ),
-                shardings,
-                tensorstore_specs,
-                [None] * len(tensorstore_specs) if global_shapes is None else global_shapes,
-                [None] * len(tensorstore_specs) if dtypes is None else dtypes,
+        # Create the appropriate coroutine based on mode
+        if use_colocated_python:
+            # Capture mesh from main thread where context is active
+            # (mesh is thread-local and won't be available in background event loop)
+            tpu_mesh = thread_resources.env.physical_mesh
+            pipeline_concurrent_gb = int(os.getenv("COLOCATED_PYTHON_PIPELINE_CONCURRENT_GB", "32"))
+
+            # Resolve any None shapes from TensorStore metadata before entering the colocated
+            # path, since out_specs_fn requires concrete shapes.
+            resolved_shapes = [
+                (
+                    tuple(
+                        ts.open(ts.Spec(spec), open=True, context=serialization.TS_CONTEXT)
+                        .result()
+                        .shape
+                    )
+                    if shape is None
+                    else shape
+                )
+                for spec, shape in zip(tensorstore_specs, global_shapes_list)
+            ]
+
+            # Use colocated Python path
+            coro = _run_colocated_deserialize(
+                shardings=shardings,
+                tensorstore_specs=tensorstore_specs,
+                global_shapes=resolved_shapes,
+                dtypes=dtypes_list,
+                concurrent_bytes=concurrent_bytes,
+                tpu_mesh=tpu_mesh,
+                pipeline_concurrent_bytes=pipeline_concurrent_gb * 10**9,
+                multi_thread_pool=self._multi_thread_pool,
             )
-            return await asyncio.gather(*future_arrays)
+        else:
+            # Use default deserialization path (direct to TPU)
+            async def _run_deserializer():
+                # Object should be created once per process.
+                # pylint: disable=protected-access
+                byte_limiter = serialization._LimitInFlightBytes(concurrent_bytes)
+                h2d_limiter = serialization._LimitInFlightBytes(_get_premapped_buffer_size())
 
-        fut = asyncio.run_coroutine_threadsafe(_run_deserializer(), self._loop)
-        result = fut.result()
+                future_arrays = jax.tree.map(
+                    functools.partial(
+                        _async_deserialize,
+                        byte_limiter=byte_limiter,
+                        h2d_limiter=h2d_limiter,
+                        single_thread_pool=self._single_thread_pool,
+                        multi_thread_pool=self._multi_thread_pool,
+                    ),
+                    shardings,
+                    tensorstore_specs,
+                    global_shapes_list,
+                    dtypes_list,
+                )
+                return await asyncio.gather(*future_arrays)
+
+            coro = _run_deserializer()
+
+        # Run the coroutine and get result
+        result = asyncio.run_coroutine_threadsafe(coro, self._loop).result()
         logging.info("deserialize took %.4f seconds.", time.perf_counter() - start_time)
         return result
 
