@@ -105,8 +105,7 @@ from tensorflow import nest as tf_nest
 
 # tensorflow_io import is necessary for tf_io to understand s3:// scheme.
 try:
-    # pylint: disable-next=import-error,unused-import
-    import tensorflow_io  # pytype: disable=import-error
+    import tensorflow_io  # noqa: F401  # pytype: disable=import-error
 except ModuleNotFoundError:
     logging.warning("tensorflow_io is not installed -- tf_io may not work with s3://")
 
@@ -114,13 +113,21 @@ from axlearn.cloud.common import metrics
 from axlearn.cloud.common.cleaner import Cleaner
 from axlearn.cloud.common.event_queue import BaseQueueClient, Event
 from axlearn.cloud.common.job_types import (
+    DEFAULT_SCALING_SPEC_NAME,
     JobMetadata,
     JobSpec,
     JobStateMetadata,
     ResourceType,
+    ScalingSpec,
     Topology,
 )
 from axlearn.cloud.common.quota import QuotaFn
+from axlearn.cloud.common.replica_manager import (
+    DESIRED_REPLICAS_KEY,
+    GRANTED_REPLICAS_KEY,
+    ReplicaManager,
+)
+from axlearn.cloud.common.scaling import aggregate_min_resources, aggregate_topology
 from axlearn.cloud.common.scheduler import BaseScheduler, JobScheduler, ResourceMap
 from axlearn.cloud.common.uploader import Uploader
 from axlearn.cloud.common.utils import merge, send_signal
@@ -329,6 +336,48 @@ def _validate_jobspec(jobspec: JobSpec):
         raise ValidationError(f"Expected {jobspec.metadata=} to be JobMetadata.")
     _validate_job_metadata(jobspec.metadata)
 
+    # When scaling_specs is set, metadata.resources and metadata.topologies
+    # must describe the baseline (min_replicas) shape.
+    if jobspec.metadata.scaling_specs:
+        seen_names: set[str] = set()
+        for spec in jobspec.metadata.scaling_specs:
+            name = spec.name or DEFAULT_SCALING_SPEC_NAME
+            if name in seen_names:
+                raise ValidationError(f"Duplicate scaling spec name {name!r} in scaling_specs.")
+            seen_names.add(name)
+            if spec.min_replicas < 1:
+                raise ValidationError(
+                    f"Expected scaling spec {name!r} min_replicas>=1, got {spec.min_replicas=}."
+                )
+            if spec.min_replicas > spec.max_replicas:
+                raise ValidationError(
+                    f"Expected scaling spec {name!r} min_replicas<=max_replicas, "
+                    f"got {spec.min_replicas=}, {spec.max_replicas=}."
+                )
+            if spec.init_replicas is not None and not (
+                spec.min_replicas <= spec.init_replicas <= spec.max_replicas
+            ):
+                raise ValidationError(
+                    f"Expected scaling spec {name!r} "
+                    f"min_replicas<=init_replicas<=max_replicas, got "
+                    f"{spec.min_replicas=}, {spec.init_replicas=}, "
+                    f"{spec.max_replicas=}."
+                )
+
+        expected_resources = aggregate_min_resources(jobspec.metadata.scaling_specs)
+        if jobspec.metadata.resources != expected_resources:
+            raise ValidationError(
+                f"Expected {jobspec.metadata.resources=} to equal "
+                f"aggregate_min_resources(scaling_specs)={expected_resources}."
+            )
+        expected_topologies = aggregate_topology(jobspec.metadata.scaling_specs)
+        actual_topologies = jobspec.metadata.topologies or []
+        if actual_topologies != expected_topologies:
+            raise ValidationError(
+                f"Expected {jobspec.metadata.topologies=} to equal "
+                f"aggregate_topology(scaling_specs)={expected_topologies}."
+            )
+
 
 def new_jobspec(
     *,
@@ -393,6 +442,17 @@ def deserialize_jobspec(f: Union[str, IO]) -> JobSpec:
             data["metadata"]["topologies"] = [
                 Topology(**topology) for topology in data["metadata"]["topologies"]
             ]
+        if data["metadata"].get("scaling_specs"):
+            data["metadata"]["scaling_specs"] = [
+                ScalingSpec(**spec) for spec in data["metadata"]["scaling_specs"]
+            ]
+            # If scaling spec is set, infer the base job spec resource
+            # requirements from the scaling specs.
+            data["metadata"]["resources"] = aggregate_min_resources(
+                data["metadata"]["scaling_specs"]
+            )
+            topologies = aggregate_topology(data["metadata"]["scaling_specs"])
+            data["metadata"]["topologies"] = topologies if topologies else None
         # Backwards compatible: only pass fields that JobMetadata currently supports.
         skipped = data["metadata"].keys() - _JOB_METADATA_FIELD_NAMES
         if skipped:
@@ -861,6 +921,10 @@ class Bastion(Configurable):
         event_publisher: Optional[BaseQueueClient.Config] = None
         # Validator to determine if job is valid.
         validator: Optional[JobValidator.Config] = None
+        # Optional manager for elastic replica state. When set, Bastion calls
+        # it before/after each schedule cycle to fetch desired replicas and
+        # publish granted replicas for elastic jobs.
+        replica_manager: Optional[ReplicaManager.Config] = None
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
@@ -909,6 +973,9 @@ class Bastion(Configurable):
         self._uploader = cfg.uploader.set(src_dir=_LOG_DIR, dst_dir=self._log_dir).instantiate()
         self._event_publisher = maybe_instantiate(cfg.event_publisher)
         self._validator = cfg.validator.instantiate() if cfg.validator else None
+        self._replica_manager: Optional[ReplicaManager] = (
+            cfg.replica_manager.instantiate() if cfg.replica_manager else None
+        )
 
     def _build_preemption_message(
         self,
@@ -1375,6 +1442,51 @@ class Bastion(Configurable):
 
         return job
 
+    def _populate_desired_replicas(
+        self,
+        schedulable_job_metadata: dict[str, JobMetadata],
+        schedulable_job_state_metadata: dict[str, JobStateMetadata],
+    ):
+        """Pulls desired replicas from the replica manager for elastic jobs.
+
+        The scheduler reads these from job_state_metadata during expansion.
+        Skips jobs without scaling_specs (non-elastic) and is a no-op when
+        no replica_manager is configured.
+        """
+        if self._replica_manager is None:
+            return
+        self._replica_manager.refresh()
+        for job_name, metadata in schedulable_job_metadata.items():
+            if not metadata.scaling_specs:
+                continue
+            desired = self._replica_manager.get_desired_replicas(job_name)
+            if desired is not None:
+                logging.info("Populated desired_replicas for %s: %s", job_name, dict(desired))
+                schedulable_job_state_metadata.setdefault(job_name, {})[DESIRED_REPLICAS_KEY] = (
+                    dict(desired)
+                )
+
+    def _publish_granted_replicas(self, schedule_results: BaseScheduler.ScheduleResults):
+        """Publishes granted replicas back to the replica manager.
+
+        Only elastic jobs (those with `granted_replicas` in their verdict
+        metadata) are forwarded. No-op when no replica_manager is configured.
+        """
+        if self._replica_manager is None:
+            return
+        for job_name, verdict in schedule_results.job_verdicts.items():
+            granted = verdict.metadata.get(GRANTED_REPLICAS_KEY)
+            if not granted:
+                continue
+            try:
+                self._replica_manager.set_granted_replicas(job_name, granted)
+            except Exception as e:  # pylint: disable=broad-except
+                logging.warning(
+                    "ReplicaManager.set_granted_replicas failed for %s: %s",
+                    job_name,
+                    e,
+                )
+
     def _update_jobs(self):
         """Handles state transitions for all jobs.
 
@@ -1394,6 +1506,8 @@ class Bastion(Configurable):
                 schedulable_job_metadata[job_name] = job.spec.metadata
                 schedulable_job_state_metadata[job_name] = job.state.metadata
 
+        self._populate_desired_replicas(schedulable_job_metadata, schedulable_job_state_metadata)
+
         # Decide which jobs to resume/pre-empt.
         schedule_options = self._get_runtime_options(
             "scheduler",
@@ -1405,6 +1519,8 @@ class Bastion(Configurable):
             dry_run=schedule_options["dry_run"],
             verbosity=schedule_options["verbosity"],
         )
+
+        self._publish_granted_replicas(schedule_results)
         self._append_to_history(schedulable_job_metadata, schedule_results)
         for job_name, verdict in schedule_results.job_verdicts.items():
             job = self._active_jobs[job_name]

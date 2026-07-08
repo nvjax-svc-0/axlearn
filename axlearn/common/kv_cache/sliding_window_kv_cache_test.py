@@ -8,7 +8,13 @@ import pytest
 from absl.testing import absltest, parameterized
 from jax.sharding import PartitionSpec
 
-from axlearn.common.kv_cache.sliding_window_kv_cache import SlidingWindowKVCache
+from axlearn.common.attention import MultiheadAttention
+from axlearn.common.attention_bias import SlidingWindowAttentionBias
+from axlearn.common.kv_cache.kv_cache import KVCache
+from axlearn.common.kv_cache.sliding_window_kv_cache import (
+    SlidingWindowKVCache,
+    enable_sliding_window_attention,
+)
 from axlearn.common.test_utils import TestCase, assert_allclose
 from axlearn.common.utils import sequence_mask
 
@@ -147,6 +153,71 @@ class SlidingWindowKVCacheTest(TestCase):
         self.assertEqual(state["key_positions"].shape, (batch, cached_kv_length))
         kp_spec = state["key_positions"].sharding.spec
         self.assertEqual(kp_spec, PartitionSpec("data"))
+
+    def test_key_positions_precision_with_bfloat16_cache(self):
+        """Regression test: positions ≥ cache_len must be stored exactly with bfloat16 cache."""
+        cached_kv_length = 4096
+        prompt_len = 5000  # > cached_kv_length to trigger ring wrap
+        max_seq_len = 6000
+        batch, n_heads, head_dim = 1, 1, 32
+        layer = (
+            SlidingWindowKVCache.default_config()
+            .set(name="bf16", cached_kv_length=cached_kv_length)
+            .instantiate(parent=None)
+        )
+        states = layer.init_states(
+            shape=SlidingWindowKVCache.Shape(
+                batch_size=batch, kv_len=max_seq_len, num_kv_heads=n_heads, per_head_dim=head_dim
+            ),
+            dtype=jnp.bfloat16,  # must trigger bf16 path
+        )
+        key_positions = jnp.arange(max_seq_len)[None, :]
+        segment_ids = jnp.where(jnp.arange(max_seq_len) < prompt_len, 1, 0)[None, :]
+        k_proj = jnp.zeros((batch, max_seq_len, n_heads, head_dim), dtype=jnp.bfloat16)
+        v_proj = jnp.zeros_like(k_proj)
+        new_state, _ = layer.extend_step(
+            states,
+            k_proj=k_proj,
+            v_proj=v_proj,
+            key_positions=key_positions,
+            segment_ids=segment_ids,
+        )
+        # Expected: each ring slot s holds the most-recent valid position p with p % cache_len == s
+        # and p in [max(0, prompt_len - cache_len), prompt_len - 1].
+        stored = new_state["key_positions"][0]
+        # Slot 0: positions {0, 4096} ∩ [904, 4999] = {4096}.
+        self.assertEqual(int(stored[0]), 4096)
+        # Slot 1: positions {1, 4097} ∩ [904, 4999] = {4097} (would be 4096 if bf16 corrupts).
+        self.assertEqual(int(stored[1]), 4097)
+        # Slot 100: {100, 4196} ∩ [904, 4999] = {4196} (would be 4192 if bf16 corrupts).
+        self.assertEqual(int(stored[100]), 4196)
+        # Slot 903: {903, 4999} ∩ [904, 4999] = {4999} (would be 4992 if bf16 corrupts).
+        self.assertEqual(int(stored[903]), 4999)
+        # Slot 904: {904} ∩ [904, 4999] = {904}.
+        self.assertEqual(int(stored[904]), 904)
+
+
+class FunctionsTest(TestCase):
+    """Tests `enable_sliding_window_attention` config rewriting."""
+
+    def test_enable_sliding_window_attention(self):
+        partition_spec = (("data",), None, "model", None)
+        cfg = MultiheadAttention.default_config().set(
+            name="attn", query_dim=8, key_dim=8, value_dim=8, num_heads=2
+        )
+        cfg.kv_cache = KVCache.default_config().set(
+            cache_dtype=jnp.bfloat16, kv_partition_spec=partition_spec
+        )
+        sliding_window_size = 4
+        out = enable_sliding_window_attention(cfg, sliding_window_size)
+
+        self.assertIs(out, cfg)  # in-place modification.
+        self.assertEqual(out.kv_cache.klass, SlidingWindowKVCache)
+        self.assertEqual(out.kv_cache.cached_kv_length, sliding_window_size)
+        self.assertEqual(out.kv_cache.cache_dtype, jnp.bfloat16)
+        self.assertEqual(out.kv_cache.kv_partition_spec, partition_spec)
+        self.assertEqual(out.mask.klass, SlidingWindowAttentionBias)
+        self.assertEqual(out.mask.sliding_window_size, sliding_window_size)
 
 
 if __name__ == "__main__":

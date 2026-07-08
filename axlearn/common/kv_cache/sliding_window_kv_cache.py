@@ -121,14 +121,12 @@ class SlidingWindowKVCache(BaseKVCache):
             max_idx = key_positions.max(initial=0, axis=1, keepdims=True)
             min_idx = jnp.maximum(max_idx - (cache_len - 1), 0)
             ring_positions = jnp.where(key_positions >= min_idx, key_positions % cache_len, invalid)
-            oh_indices = jax.nn.one_hot(ring_positions, cache_len, dtype=cached_key.dtype)
+            oh_indices = jax.nn.one_hot(ring_positions, cache_len, dtype=key_positions.dtype)
             pos_scattered = jnp.einsum("bt,bts->bs", key_positions, oh_indices)
             k_scattered = jnp.einsum("b...t,bts->b...s", k_proj, oh_indices)
             v_scattered = jnp.einsum("b...t,bts->b...s", v_proj, oh_indices)
             keep_mask = ~oh_indices.any(axis=1)  # [B, S]
-            updated_state["key_positions"] = cached_pos * keep_mask + pos_scattered.astype(
-                cached_pos.dtype
-            )
+            updated_state["key_positions"] = cached_pos * keep_mask + pos_scattered
             keep_mask = keep_mask[:, None, None, :]  # [B, 1, 1, S]
             updated_state["key"] = cached_key * keep_mask + k_scattered.astype(cached_key.dtype)
             updated_state["value"] = cached_value * keep_mask + v_scattered.astype(
@@ -168,13 +166,11 @@ def enable_sliding_window_attention(
     Returns:
         The in-place modified MultiheadAttention Config with sliding window attention enabled.
     """
-    if cfg.kv_cache is not None:
-        cache_dtype = cfg.kv_cache.cache_dtype
-    else:
-        cache_dtype = None
     cfg.set(
         kv_cache=SlidingWindowKVCache.default_config().set(
-            cache_dtype=cache_dtype, cached_kv_length=sliding_window_size
+            cached_kv_length=sliding_window_size,
+            cache_dtype=cfg.kv_cache.cache_dtype,
+            kv_partition_spec=cfg.kv_cache.kv_partition_spec,
         ),
         mask=SlidingWindowAttentionBias.default_config(sliding_window_size=sliding_window_size),
     )

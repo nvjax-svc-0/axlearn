@@ -123,6 +123,46 @@ class ArtifactRegistryBundler(DockerBundler):
         return super()._build_and_push(*args, **kwargs)
 
 
+def _image_exists_in_artifact_registry(image_id: str) -> bool:
+    """Checks whether a Docker image exists in Artifact Registry.
+
+    Args:
+        image_id: Full Artifact Registry image URL with tag, e.g.
+            ``us-docker.pkg.dev/my-project/my-repo/my-image:v1``.
+
+    Returns:
+        True if the image exists, False otherwise.
+    """
+    logging.info("Checking Artifact Registry for image: %s", image_id)
+    result = subprocess.run(
+        ["gcloud", "artifacts", "docker", "images", "describe", image_id],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode == 0:
+        logging.info("Image found in Artifact Registry: %s", image_id)
+        return True
+    logging.warning(
+        "Image not found in Artifact Registry: %s\n%s",
+        image_id,
+        result.stderr.decode().strip(),
+    )
+    return False
+
+
+def _region_from_worker_pool(worker_pool: str) -> Optional[str]:
+    """Extracts the GCP region from a worker pool resource name.
+
+    Expected format: projects/<project>/locations/<region>/workerPools/<pool>
+    Returns None if the format doesn't match.
+    """
+    parts = worker_pool.split("/")
+    if len(parts) == 6 and parts[2] == "locations":
+        return parts[3]
+    return None
+
+
 @register_bundler
 class CloudBuildBundler(BaseDockerBundler):
     """A bundler that uses CloudBuild."""
@@ -143,6 +183,7 @@ class CloudBuildBundler(BaseDockerBundler):
             timeout_seconds: CloudBuild timeout in seconds. Applied both server-side (via the
                 `timeout:` field in cloudbuild.yaml) and to the client-side polling in
                 `wait_until_finished()`.
+            parallel: Whether to build main and sidecar images in parallel.
         """
 
         # GCP project.
@@ -151,6 +192,7 @@ class CloudBuildBundler(BaseDockerBundler):
         is_async: bool = True
         private_worker_pool: Optional[str] = None
         timeout_seconds: int = 3600
+        parallel: Optional[bool] = None
 
     @classmethod
     def from_spec(
@@ -162,6 +204,8 @@ class CloudBuildBundler(BaseDockerBundler):
         cfg.dockerfile = cfg.dockerfile or gcp_settings("default_dockerfile", required=False, fv=fv)
         cfg.is_async = to_bool(cfg.is_async)
         cfg.timeout_seconds = int(cfg.timeout_seconds)
+        if cfg.parallel is not None:
+            cfg.parallel = to_bool(cfg.parallel)
         return cfg
 
     # pylint: disable-next=no-self-use,unused-argument
@@ -194,9 +238,14 @@ class CloudBuildBundler(BaseDockerBundler):
         build_steps = []
         images_list = [f'"{image}"', f'"{latest_tag}"']
 
+        # The '-' indicates that this step begins immediately.
+        wait_for = 'waitFor: ["-"]' if cfg.parallel else ""
+
         # Main image build step
         build_steps.append(
             f"""- name: "gcr.io/cloud-builders/docker"
+  id: "build-main"
+  {wait_for}
   args: [
     "build",
     "-f", "{os.path.relpath(dockerfile, context)}",
@@ -224,6 +273,8 @@ class CloudBuildBundler(BaseDockerBundler):
 
             build_steps.append(
                 f"""- name: "gcr.io/cloud-builders/docker"
+  id: "build-{sidecar}"
+  {wait_for}
   args: [
     "build",
     "-f", "{os.path.relpath(dockerfile, context)}",
@@ -279,7 +330,11 @@ options:
     def wait_until_finished(self, name: str, wait_timeout: Optional[int] = None):
         """Waits for async CloudBuild to finish by polling for status.
 
-        Is a no-op if `cfg.is_async` is False.
+        When ``cfg.skip_bundle`` is True, no build was submitted; instead the image is
+        verified to already exist in Artifact Registry.  If it does not, falls back to
+        scanning cloud build across all known regions.
+
+        Is a no-op if ``cfg.is_async`` is False.
 
         Args:
             name: Bundle name.
@@ -290,22 +345,47 @@ options:
             ValueError: If the async build fails.
         """
         cfg: CloudBuildBundler.Config = self.config
+        # only verify image or cloud build under async mode
+        if not cfg.is_async:
+            return
+
+        # if cloud build is skipped, first look for the image from registry,
+        # fast pass if the image already exists, and fallback to regular
+        # cloud build check if the image does not exist.
+        if cfg.skip_bundle:
+            image_id = name if parse_tag_from_image_id(name) else self.id(name)
+            logging.info("skip_bundle=True: verifying image exists in registry: %s", image_id)
+            if _image_exists_in_artifact_registry(image_id):
+                return
+            logging.warning(
+                "skip_bundle=True but image not found in Artifact Registry: %s; "
+                "falling back to scanning cloud build.",
+                image_id,
+            )
+
         wait_timeout = wait_timeout or cfg.timeout_seconds
-        if cfg.is_async:
-            if tag := parse_tag_from_image_id(name):
-                wait_for_cloud_build(
-                    project_id=cfg.project,
-                    image_id=name,
-                    tags=[tag],
-                    wait_timeout=wait_timeout,
-                )
-            else:
-                wait_for_cloud_build(
-                    project_id=cfg.project,
-                    image_id=self.id(name),
-                    tags=[name],
-                    wait_timeout=wait_timeout,
-                )
+        region = None
+        # if worker pool configured, directly check the cloud build from the worker pool
+        if cfg.private_worker_pool:
+            region = _region_from_worker_pool(cfg.private_worker_pool)
+            if region:
+                logging.info("Using region '%s' from private_worker_pool config.", region)
+        if tag := parse_tag_from_image_id(name):
+            wait_for_cloud_build(
+                project_id=cfg.project,
+                image_id=name,
+                tags=[tag],
+                wait_timeout=wait_timeout,
+                region=region,
+            )
+        else:
+            wait_for_cloud_build(
+                project_id=cfg.project,
+                image_id=self.id(name),
+                tags=[name],
+                wait_timeout=wait_timeout,
+                region=region,
+            )
 
 
 @register_bundler

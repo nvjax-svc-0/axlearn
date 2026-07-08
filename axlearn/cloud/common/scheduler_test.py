@@ -11,13 +11,21 @@ from unittest import mock
 
 from absl.testing import absltest, parameterized
 
-from axlearn.cloud.common.job_types import JobStateMetadata, ResourceMap
+from axlearn.cloud.common.job_types import (
+    DEFAULT_SCALING_SPEC_NAME,
+    JobStateMetadata,
+    ResourceMap,
+    ScalingSpec,
+)
 from axlearn.cloud.common.quota import QuotaInfo
+from axlearn.cloud.common.replica_manager import GRANTED_REPLICAS_KEY
 from axlearn.cloud.common.scheduler import (
     BaseScheduler,
     JobMetadata,
     JobQueue,
     JobScheduler,
+    JobVerdict,
+    PriorityFIFO,
     ProjectJobSorter,
     ReporterFn,
     ReportingScheduler,
@@ -26,6 +34,7 @@ from axlearn.cloud.common.scheduler import (
     _compute_total_limits,
     _normalize_quotas,
     _recursively_to_dict,
+    _SlotInfo,
     composite_reporter,
 )
 from axlearn.common.config import ConfigOr, InstantiableConfig, config_for_function
@@ -94,6 +103,77 @@ class ProjectJobSorterTest(absltest.TestCase):
         )
         for job_id, job_metadata in job_queue:
             self.assertDictEqual(jobs[job_id].resources, job_metadata.resources, msg=job_id)
+
+    def test_use_user_usage_disabled(self):
+        """When use_user_usage is disabled, jobs sort by (priority, creation_time) only."""
+        sorter: ProjectJobSorter = (
+            ProjectJobSorter.default_config().set(use_user_usage=False).instantiate()
+        )
+        yesterday = datetime.now() - timedelta(days=1)
+        jobs = {
+            "a1": JobMetadata(
+                user_id="a",
+                project_id="p1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=1),
+                resources={"tpu": 100},
+            ),
+            "a2": JobMetadata(
+                user_id="a",
+                project_id="p1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=2),
+                resources={"tpu": 100},
+            ),
+            "b3": JobMetadata(
+                user_id="b",
+                project_id="p1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=3),
+                resources={"tpu": 5},
+            ),
+        }
+        job_queue: JobQueue = sorter.sort(jobs)
+        # Without user usage, jobs sort by (priority, creation_time) only.
+        # User "a" is NOT deprioritized despite high resource usage.
+        self.assertSequenceEqual(
+            ["a1", "a2", "b3"],
+            [job_id for job_id, _ in job_queue],
+        )
+
+    def test_use_user_usage_default_true(self):
+        """Default use_user_usage=True enables fair-share sorting."""
+        sorter: ProjectJobSorter = ProjectJobSorter.default_config().instantiate()
+        yesterday = datetime.now() - timedelta(days=1)
+        jobs = {
+            "a1": JobMetadata(
+                user_id="a",
+                project_id="p1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=1),
+                resources={"tpu": 100},
+            ),
+            "a2": JobMetadata(
+                user_id="a",
+                project_id="p1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=2),
+                resources={"tpu": 100},
+            ),
+            "b3": JobMetadata(
+                user_id="b",
+                project_id="p1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=3),
+                resources={"tpu": 5},
+            ),
+        }
+        job_queue: JobQueue = sorter.sort(jobs)
+        # Default (True): user "b" gets prioritized over "a"'s second job.
+        self.assertSequenceEqual(
+            ["a1", "b3", "a2"],
+            [job_id for job_id, _ in job_queue],
+        )
 
 
 def _mock_job_metadata(resources, creation_time=None):
@@ -602,6 +682,196 @@ class TierSchedulerTest(parameterized.TestCase):
         )
         self.assertEqual(schedule_result.unused_limits, unused_limits)
 
+    def test_parent_dependencies_admitted_admits_dependents(self):
+        # Parent fits, dependents fit -> all admitted. Without the gate
+        # firing, the verdicts should be indistinguishable from a normal
+        # schedule.
+        now = datetime.now()
+        project_jobs = {
+            "p": [
+                (
+                    "parent",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+                (
+                    "parent--exp-default-1",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+                (
+                    "parent--exp-default-2",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+            ],
+        }
+        sched: TierScheduler = TierScheduler.default_config().instantiate()
+        results = sched.schedule(
+            resource_limits=[{"v4": 12}],
+            project_quotas={"p": {"v4": 12}},
+            project_jobs=project_jobs,
+            job_state_metadata={},
+            parent_dependencies={
+                "parent--exp-default-1": "parent",
+                "parent--exp-default-2": "parent",
+            },
+        )
+        for name in ["parent", "parent--exp-default-1", "parent--exp-default-2"]:
+            self.assertTrue(results.job_verdicts[name].should_run(), name)
+            self.assertIsNone(results.job_verdicts[name].unmet_dependencies, name)
+        self.assertEqual({"v4": 12}, results.project_usages["p"])
+
+    def test_parent_dependencies_rejected_rejects_dependents_no_resource_consumption(self):
+        # Parent over project quota -> rejected. Dependents must follow
+        # without consuming resources, even though they would individually
+        # fit.
+        now = datetime.now()
+        project_jobs = {
+            "p": [
+                (
+                    "parent",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 100},
+                    ),
+                ),
+                (
+                    "parent--exp-default-1",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+            ],
+        }
+        sched: TierScheduler = TierScheduler.default_config().instantiate()
+        results = sched.schedule(
+            resource_limits=[{"v4": 12}],
+            project_quotas={"p": {"v4": 12}},
+            project_jobs=project_jobs,
+            job_state_metadata={},
+            parent_dependencies={"parent--exp-default-1": "parent"},
+        )
+        self.assertFalse(results.job_verdicts["parent"].should_run())
+        slot = results.job_verdicts["parent--exp-default-1"]
+        self.assertFalse(slot.should_run())
+        # Slot rejection is via unmet_dependencies, not over_limits.
+        self.assertIsNone(slot.over_limits)
+        self.assertEqual({"parent"}, slot.unmet_dependencies)
+        # No resources consumed for parent or slot. project_usages["p"]["v4"]
+        # may be present at 0 (autovivified during priority-queue sorting),
+        # so check the value rather than the absence of the key.
+        self.assertEqual(0, results.project_usages["p"].get("v4", 0))
+
+    def test_parent_dependencies_rejected_frees_quota_for_other_jobs(self):
+        # Parent rejected -> its dependents don't consume resources, leaving
+        # quota available for other admittable jobs in the same project.
+        now = datetime.now()
+        project_jobs = {
+            "p": [
+                # First in priority order: parent that doesn't fit (over project quota).
+                (
+                    "parent",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 100},
+                    ),
+                ),
+                (
+                    "parent--exp-default-1",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+                # Lower priority (later creation_time): a normal job that
+                # would have lost in pass 1 if the orphan slot consumed quota.
+                (
+                    "other",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now + timedelta(seconds=1),
+                        resources={"v4": 4},
+                    ),
+                ),
+            ],
+        }
+        sched: TierScheduler = TierScheduler.default_config().instantiate()
+        results = sched.schedule(
+            resource_limits=[{"v4": 8}],
+            project_quotas={"p": {"v4": 8}},
+            project_jobs=project_jobs,
+            job_state_metadata={},
+            parent_dependencies={"parent--exp-default-1": "parent"},
+        )
+        self.assertFalse(results.job_verdicts["parent"].should_run())
+        self.assertFalse(results.job_verdicts["parent--exp-default-1"].should_run())
+        # `other` admits using the quota the orphan slot did not claim.
+        self.assertTrue(results.job_verdicts["other"].should_run())
+        self.assertEqual({"v4": 4}, results.project_usages["p"])
+
+    def test_parent_dependencies_missing_parent_raises(self):
+        # If the project queue is sorted such that a dependent is processed
+        # before its parent (a contract violation in ProjectJobSorter /
+        # _demote_unschedulable_jobs), the scheduler raises RuntimeError
+        # rather than silently rejecting the dependent.
+        now = datetime.now()
+        project_jobs = {
+            "p": [
+                # Dependent listed BEFORE parent — violates the ordering
+                # contract that parents must be visited first.
+                (
+                    "parent--exp-default-1",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+                (
+                    "parent",
+                    JobMetadata(
+                        user_id="u",
+                        project_id="p",
+                        creation_time=now,
+                        resources={"v4": 4},
+                    ),
+                ),
+            ],
+        }
+        sched: TierScheduler = TierScheduler.default_config().instantiate()
+        with self.assertRaisesRegex(RuntimeError, "parent has not been scheduled"):
+            sched.schedule(
+                resource_limits=[{"v4": 12}],
+                project_quotas={"p": {"v4": 12}},
+                project_jobs=project_jobs,
+                job_state_metadata={},
+                parent_dependencies={"parent--exp-default-1": "parent"},
+            )
+
 
 def _mock_get_resource_limits(*args):
     del args
@@ -939,6 +1209,151 @@ class TestJobScheduler(parameterized.TestCase):
                 mock_reporter_as_fn.assert_called_once()
             else:
                 mock_reporter_as_fn.assert_not_called()
+
+    def test_per_project_sorter_overrides(self):
+        """per_project_sorter_overrides end-to-end: override disables fair-share for project1."""
+        quota_info = QuotaInfo(
+            total_resources=[{"tpu": 1000}],
+            project_resources={
+                "project1": {"tpu": 500},
+                "project2": {"tpu": 500},
+            },
+            project_membership={"project1": [], "project2": []},
+        )
+        cfg = JobScheduler.default_config().set(
+            quota=config_for_function(lambda: lambda *args: quota_info),
+            # project1: use FIFO policy — jobs sort by (priority, creation_time) only.
+            per_project_sorter_overrides={"project1": PriorityFIFO},
+        )
+        sched: JobScheduler = cfg.instantiate()
+
+        yesterday = datetime.now() - timedelta(days=1)
+
+        # project1 jobs: two users, same priority.
+        # user "a" submits first with a large job, then user "b" submits a small job.
+        # With fair-share DISABLED: order should follow creation_time → a1, a2, b1.
+        # With fair-share ENABLED:  after a1 consumes 100 TPUs, b1 should jump ahead of a2.
+        jobs = {
+            "a1": JobMetadata(
+                user_id="a",
+                project_id="project1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=1),
+                resources={"tpu": 100},
+            ),
+            "a2": JobMetadata(
+                user_id="a",
+                project_id="project1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=2),
+                resources={"tpu": 100},
+            ),
+            "b1": JobMetadata(
+                user_id="b",
+                project_id="project1",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=3),
+                resources={"tpu": 5},
+            ),
+            # project2 jobs: same setup but uses default fair-share sorter.
+            "c1": JobMetadata(
+                user_id="c",
+                project_id="project2",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=1),
+                resources={"tpu": 100},
+            ),
+            "c2": JobMetadata(
+                user_id="c",
+                project_id="project2",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=2),
+                resources={"tpu": 100},
+            ),
+            "d1": JobMetadata(
+                user_id="d",
+                project_id="project2",
+                priority=2,
+                creation_time=yesterday + timedelta(seconds=3),
+                resources={"tpu": 5},
+            ),
+        }
+
+        results = sched.schedule(jobs, {})
+        verdicts = results.job_verdicts
+
+        # All jobs should run (plenty of resources).
+        for job_id in ["a1", "a2", "b1", "c1", "c2", "d1"]:
+            self.assertTrue(verdicts[job_id].should_run(), msg=f"{job_id} should run")
+
+        # project1 (fair-share disabled): job order must be a1 → a2 → b1.
+        # The scheduler processes jobs in sorted order; we check relative positions in verdicts.
+        p1_order = [jid for jid in verdicts if jid in ("a1", "a2", "b1")]
+        self.assertEqual(["a1", "a2", "b1"], p1_order, msg="project1 should sort by creation_time")
+
+        # project2 (fair-share enabled): after c1 schedules, user "d" should jump ahead of c2.
+        # Fair-share ordering: c1 → d1 → c2.
+        p2_order = [jid for jid in verdicts if jid in ("c1", "c2", "d1")]
+        self.assertEqual(["c1", "d1", "c2"], p2_order, msg="project2 should use fair-share")
+
+
+class TestExpansionSlotCollapse(parameterized.TestCase):
+    """Tests _collapse_expansion_verdicts behavior for unadmitted parents."""
+
+    def _make_elastic_parent(self) -> JobMetadata:
+        return JobMetadata(
+            user_id="u",
+            project_id="p",
+            creation_time=datetime.now(),
+            resources={"v4": 8},
+            scaling_specs=[
+                ScalingSpec(
+                    min_replicas=1,
+                    max_replicas=4,
+                    resources_per_replica={"v4": 8},
+                )
+            ],
+        )
+
+    def test_admitted_slot_aggregates_into_admitted_parent(self):
+        # Baseline: when both parent and slot are admitted, the slot's
+        # admission count rolls up into the parent's granted_replicas.
+        original = {"parent": self._make_elastic_parent()}
+        slot_name = "parent--exp-default-1"
+        slot_info = {slot_name: _SlotInfo(parent_job="parent", name=DEFAULT_SCALING_SPEC_NAME)}
+        results = BaseScheduler.ScheduleResults(
+            project_limits={},
+            project_usages={},
+            job_verdicts={"parent": JobVerdict(), slot_name: JobVerdict()},
+        )
+        collapsed = JobScheduler._collapse_expansion_verdicts(results, slot_info, original)
+        # Slot is dropped from final verdicts; parent records min + 1 admitted slot.
+        self.assertNotIn(slot_name, collapsed.job_verdicts)
+        self.assertEqual(
+            collapsed.job_verdicts["parent"].metadata[GRANTED_REPLICAS_KEY],
+            {DEFAULT_SCALING_SPEC_NAME: 2},
+        )
+
+    def test_admitted_slot_dropped_when_parent_rejected(self):
+        # When a slot is admitted but its parent is rejected, the slot is
+        # dropped (does not contribute to granted_replicas) and the parent's
+        # granted count stays at the pre-pass min_replicas baseline.
+        original = {"parent": self._make_elastic_parent()}
+        slot_name = "parent--exp-default-1"
+        slot_info = {slot_name: _SlotInfo(parent_job="parent", name=DEFAULT_SCALING_SPEC_NAME)}
+        results = BaseScheduler.ScheduleResults(
+            project_limits={},
+            project_usages={},
+            job_verdicts={
+                "parent": JobVerdict(over_limits={"v4"}),
+                slot_name: JobVerdict(),
+            },
+        )
+        collapsed = JobScheduler._collapse_expansion_verdicts(results, slot_info, original)
+        self.assertNotIn(slot_name, collapsed.job_verdicts)
+        # An unadmitted parent doesn't get the granted_replicas pre-pass seeding
+        # because the pre-pass skips rejected verdicts (`if not verdict: continue`).
+        self.assertNotIn(GRANTED_REPLICAS_KEY, collapsed.job_verdicts["parent"].metadata)
 
 
 if __name__ == "__main__":

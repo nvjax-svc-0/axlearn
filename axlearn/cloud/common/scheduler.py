@@ -19,6 +19,7 @@ from typing import Any, NamedTuple, Optional, Protocol
 from absl import logging
 
 from axlearn.cloud.common.job_types import (
+    DEFAULT_SCALING_SPEC_NAME,
     JobMetadata,
     JobQueue,
     JobStateMetadata,
@@ -26,8 +27,11 @@ from axlearn.cloud.common.job_types import (
     ProjectResourceMap,
     ResourceMap,
     ResourceType,
+    ScalingSpec,
+    Topology,
 )
 from axlearn.cloud.common.quota import QuotaFn
+from axlearn.cloud.common.replica_manager import DESIRED_REPLICAS_KEY, GRANTED_REPLICAS_KEY
 from axlearn.common.config import (
     REQUIRED,
     ConfigOr,
@@ -41,14 +45,29 @@ from axlearn.common.config import (
 class ProjectJobSorter(Configurable):
     """Sorts jobs within a project based on the user id, creation time, and resource demands."""
 
+    @config_class
+    class Config(Configurable.Config):
+        """Configures ProjectJobSorter.
+
+        Attributes:
+            use_user_usage: When True, users with higher cumulative resource usage are
+                deprioritized within the same priority level (usage-based fairshare). When False,
+                jobs are sorted by (priority, creation_time) only, with no fairness adjustment.
+        """
+
+        use_user_usage: bool = True
+
     def sort(self, jobs: Mapping[str, JobMetadata]) -> JobQueue:
         """Sorts jobs into a queue.
 
-        Within a project, jobs are sorted first by priority (1 - highest), then aggregate usages
-        of the users, and finally creation times:
+        When ``use_user_usage`` is True, jobs are sorted first by priority (1 - highest), then by
+        aggregate resource usage of the submitting user, and finally by creation time:
         (1) Of jobs of the same priority, between jobs of different users, those created by users
             with less resource usage will be prioritized;
         (2) Between jobs of the same user, the older jobs will be prioritized.
+
+        When ``use_user_usage`` is False, the usage-based fairshare step is skipped and jobs are
+        sorted by (priority, creation_time) only, without any per-user deprioritization.
 
         Args:
             jobs: A mapping from job ids to metadata.
@@ -57,6 +76,7 @@ class ProjectJobSorter(Configurable):
             A queue of jobs to be scheduled, with higher priority jobs in front of lower priority
             ones.
         """
+        cfg = self.config
         # Mapping: user_id -> List[(priority, creation_time, job_id)].
         user_job_map = collections.defaultdict(list)
         for job_id, job_metadata in jobs.items():
@@ -106,10 +126,15 @@ class ProjectJobSorter(Configurable):
             if user_jobs:
                 # The user has more jobs. Add it back to `user_queue`.
                 next_priority, next_creation_time, next_job_id = user_jobs[0]
+                next_usage = 0
+                if cfg.use_user_usage:
+                    next_usage = queue_item.usage + self._aggregate_resources(
+                        job_metadata.resources
+                    )
                 user_queue.put(
                     QueueItem(
                         priority=next_priority,
-                        usage=queue_item.usage + self._aggregate_resources(job_metadata.resources),
+                        usage=next_usage,
                         creation_time=next_creation_time,
                         job_id=next_job_id,
                         user_id=queue_item.user_id,
@@ -123,6 +148,15 @@ class ProjectJobSorter(Configurable):
         return sum(resource_map.values())
 
 
+# Named sorter configs.
+PriorityFairness: ProjectJobSorter.Config = ProjectJobSorter.default_config().set(
+    use_user_usage=True,
+)
+PriorityFIFO: ProjectJobSorter.Config = ProjectJobSorter.default_config().set(
+    use_user_usage=False,
+)
+
+
 @dataclasses.dataclass
 class JobVerdict:
     """Describes whether the job should run.
@@ -130,14 +164,18 @@ class JobVerdict:
     Attributes:
         over_limits: If the job cannot be scheduled, the set of resource types on which the job's
             demands exceed the project limits.
+        unmet_dependencies: If the job cannot be scheduled because a dependency (e.g. its
+            scheduler-tracked parent for an expansion slot) was not admitted, the set of
+            unmet dependency job ids.
         metadata: Metadata for each verdict. Defaults to an empty dict.
     """
 
     over_limits: Optional[set[ResourceType]] = None
+    unmet_dependencies: Optional[set[str]] = None
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def should_run(self):
-        return not self.over_limits
+        return not self.over_limits and not self.unmet_dependencies
 
     def __bool__(self):
         return self.should_run()
@@ -233,9 +271,16 @@ def _compute_total_limits(resource_limits: Sequence[ResourceMap[int]]) -> Resour
     return total_limits
 
 
-def _demote_unschedulable_jobs(jobs: JobQueue, *, limits: ResourceMap[int]) -> JobQueue:
+def _demote_unschedulable_jobs(
+    jobs: JobQueue,
+    *,
+    limits: ResourceMap[int],
+    parent_dependencies: Optional[Mapping[str, str]] = None,
+) -> JobQueue:
     schedulable = []
     unschedulable = []
+    unschedulable_names: set[str] = set()
+    parent_dependencies = parent_dependencies or {}
     for job_name, job_metadata in jobs:
         resources = job_metadata.resources
         is_schedulable = True
@@ -243,13 +288,55 @@ def _demote_unschedulable_jobs(jobs: JobQueue, *, limits: ResourceMap[int]) -> J
             if demand > limits.get(resource_type, 0):
                 is_schedulable = False
                 break
+        # Also demote if a known dependency was already demoted, so the
+        # pair stays together. Relies on `jobs` being in dependency-respecting
+        # order (parents before their dependents), which the ProjectJobSorter
+        # output satisfies for expansion slots.
+        if parent_dependencies.get(job_name) in unschedulable_names:
+            is_schedulable = False
         if is_schedulable:
             schedulable.append((job_name, job_metadata))
         else:
+            unschedulable_names.add(job_name)
             logging.info("Unschedulable job: %s: %s", job_name, job_metadata)
             unschedulable.append((job_name, job_metadata))
     # Put unscheduable jobs after the schedable ones.
     return schedulable + unschedulable
+
+
+def _check_parent_dependency(
+    job_id: str,
+    *,
+    parent_dependencies: Optional[Mapping[str, str]],
+    job_verdicts: Mapping[str, "JobVerdict"],
+) -> Optional["JobVerdict"]:
+    """Returns a non-admitting verdict if this job depends on an unadmitted parent.
+
+    Used by the parent-admission gate in the inner-scheduler loop: a job
+    listed in `parent_dependencies` is rejected without consuming
+    resources when its parent has been processed-and-rejected. A missing
+    parent verdict indicates that the sort order placed the dependent
+    before its parent — a contract violation in `ProjectJobSorter` /
+    `_demote_unschedulable_jobs` — and raises a `RuntimeError`.
+
+    Returns None when the job has no parent dependency or its parent is
+    admitted; the caller should then proceed with the normal admission
+    flow.
+    """
+    if not parent_dependencies or job_id not in parent_dependencies:
+        return None
+    parent_id = parent_dependencies[job_id]
+    parent_verdict = job_verdicts.get(parent_id)
+    if parent_verdict is None:
+        raise RuntimeError(
+            f"Job {job_id} depends on {parent_id} but the parent has not "
+            f"been scheduled yet. Parents must always be scheduled before "
+            f"their dependents — check ProjectJobSorter / "
+            f"_demote_unschedulable_jobs ordering."
+        )
+    if not parent_verdict.should_run():
+        return JobVerdict(unmet_dependencies={parent_id})
+    return None
 
 
 class BaseVerdictProvider(Configurable):
@@ -386,6 +473,7 @@ class TierScheduler(BaseScheduler):
         project_quotas: ProjectResourceMap,
         project_jobs: ProjectJobs,
         job_state_metadata: dict[str, JobStateMetadata],
+        parent_dependencies: Optional[Mapping[str, str]] = None,
         verbosity: int = 0,
     ) -> BaseScheduler.ScheduleResults:
         """See `BaseScheduler.schedule` for details."""
@@ -406,7 +494,11 @@ class TierScheduler(BaseScheduler):
         # Maps project_id -> deque of (job_id, job_metadata).
         project_job_queues: dict[str, collections.deque[tuple[str, JobMetadata]]] = {
             project_id: collections.deque(
-                _demote_unschedulable_jobs(sorted_jobs, limits=remaining_limits)
+                _demote_unschedulable_jobs(
+                    sorted_jobs,
+                    limits=remaining_limits,
+                    parent_dependencies=parent_dependencies,
+                )
             )
             for project_id, sorted_jobs in project_jobs.items()
         }
@@ -457,6 +549,19 @@ class TierScheduler(BaseScheduler):
         while not project_queue.empty():
             project_usage_ratio, _, project_id = project_queue.get()
             job_id, job_metadata = project_job_queues[project_id].popleft()
+
+            # Reject without consuming resources when this job depends on a
+            # parent that wasn't admitted in this cycle.
+            gate_verdict = _check_parent_dependency(
+                job_id,
+                parent_dependencies=parent_dependencies,
+                job_verdicts=job_verdicts,
+            )
+            if gate_verdict is not None:
+                job_verdicts[job_id] = gate_verdict
+                if project_job_queues[project_id]:
+                    project_queue.put(project_queue_item(project_id))
+                continue
 
             # Admit the highest priority job within the project.
             verdict = self._verdict_provider.get_verdict(
@@ -611,9 +716,24 @@ class ReportingScheduler(BaseScheduler):
         """
         schedule_results = self._inner.schedule(**kwargs)
 
-        # Handle reports.
-        self._reporter(schedule_results=schedule_results, **kwargs)
+        # Pass each reporter argument explicitly so the reporter contract
+        # stays fixed even as the inner-scheduler signature evolves.
+        self._reporter(
+            schedule_results=schedule_results,
+            resource_limits=kwargs["resource_limits"],
+            project_quotas=kwargs["project_quotas"],
+            project_jobs=kwargs["project_jobs"],
+            job_state_metadata=kwargs["job_state_metadata"],
+            verbosity=kwargs.get("verbosity", 0),
+        )
         return schedule_results
+
+
+class _SlotInfo(NamedTuple):
+    """Tracks which parent job and scaling spec an expansion slot belongs to."""
+
+    parent_job: str
+    name: str
 
 
 class JobScheduler(Configurable):
@@ -627,11 +747,13 @@ class JobScheduler(Configurable):
             quota: A config that instantiates to a QuotaFn.
             sorter: Sorter that decides ordering of jobs-to-schedule.
             scheduler: Scheduler that decides whether to resume/suspend jobs.
+            per_project_sorter_overrides: Per-project sorter configs.
         """
 
         quota: Required[ConfigOr[QuotaFn]] = REQUIRED
-        sorter: ProjectJobSorter.Config = ProjectJobSorter.default_config()
+        sorter: ProjectJobSorter.Config = PriorityFairness
         scheduler: BaseScheduler.Config = TierScheduler.default_config()
+        per_project_sorter_overrides: Optional[dict[str, ProjectJobSorter.Config]] = None
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
@@ -639,6 +761,10 @@ class JobScheduler(Configurable):
         self._quota = maybe_instantiate(cfg.quota)
         self._sorter: ProjectJobSorter = cfg.sorter.instantiate()
         self._scheduler: BaseScheduler = cfg.scheduler.instantiate()
+        self._project_sorters: dict[str, ProjectJobSorter] = {}
+        if cfg.per_project_sorter_overrides:
+            for project_id, override_cfg in cfg.per_project_sorter_overrides.items():
+                self._project_sorters[project_id] = override_cfg.instantiate()
 
     def schedule(
         self,
@@ -663,26 +789,40 @@ class JobScheduler(Configurable):
         Returns:
             The scheduling results.
         """
+        # Expand elastic jobs into base + expansion slots.
+        expanded_metadata, slot_info = self._expand_elastic_jobs(job_metadata, job_state_metadata)
+
         # Group jobs by project.
         project_jobs = collections.defaultdict(dict)
-        for job_name, metadata in job_metadata.items():
+        for job_name, metadata in expanded_metadata.items():
             project_jobs[metadata.project_id][job_name] = metadata
 
         # Sort jobs according to priority.
         for project_id, jobs_to_sort in project_jobs.items():
-            project_jobs[project_id] = self._sorter.sort(jobs_to_sort)
+            sorter = self._project_sorters.get(project_id, self._sorter)
+            project_jobs[project_id] = sorter.sort(jobs_to_sort)
 
         # Fetch quotas each time.
         quota_info = self._quota()
         resource_limits = quota_info.total_resources
         project_quotas = quota_info.project_resources
 
+        # Express each expansion slot's parent so the inner scheduler can
+        # reject orphan slots without consuming project quota.
+        parent_dependencies = {name: info.parent_job for name, info in slot_info.items()}
+
         schedule_results = self._scheduler.schedule(
             resource_limits=resource_limits,
             project_quotas=project_quotas,
             project_jobs=project_jobs,
             job_state_metadata=job_state_metadata,
+            parent_dependencies=parent_dependencies,
             verbosity=verbosity,
+        )
+
+        # Collapse expansion slot verdicts back into parent jobs.
+        schedule_results = self._collapse_expansion_verdicts(
+            schedule_results, slot_info, job_metadata
         )
 
         # Construct mock verdicts allowing everything to be scheduled.
@@ -697,3 +837,158 @@ class JobScheduler(Configurable):
                 job_verdicts={job_name: JobVerdict() for job_name in schedule_results.job_verdicts},
             )
         return schedule_results
+
+    def _expand_elastic_jobs(
+        self,
+        job_metadata: dict[str, JobMetadata],
+        job_state_metadata: dict[str, JobStateMetadata],
+    ) -> tuple[dict[str, JobMetadata], dict[str, _SlotInfo]]:
+        """Expand elastic jobs into base job + expansion slots.
+
+        Each expansion slot represents one additional replica for a scaling group.
+        Slots compete in the normal scheduler priority queue alongside all other jobs.
+
+        This method is stateless: every cycle, all slots from min_replicas to target
+        are injected from scratch.
+
+        Args:
+            job_metadata: Original job metadata mapping.
+            job_state_metadata: Current job state metadata.
+
+        Returns:
+            Tuple of (expanded_metadata, slot_info) where slot_info maps slot names
+            to their parent job and name for use during collapse.
+        """
+        expanded = dict(job_metadata)
+        slot_info: dict[str, _SlotInfo] = {}
+
+        for job_name, metadata in job_metadata.items():
+            if not metadata.scaling_specs:
+                continue
+
+            for spec in metadata.scaling_specs:
+                target = self._get_expansion_target(job_name, spec, job_state_metadata)
+                new_slots, new_info = self._create_expansion_slots(job_name, metadata, spec, target)
+                expanded.update(new_slots)
+                slot_info.update(new_info)
+
+        return expanded, slot_info
+
+    def _create_expansion_slots(
+        self,
+        job_name: str,
+        metadata: JobMetadata,
+        spec: ScalingSpec,
+        target: int,
+    ) -> tuple[dict[str, JobMetadata], dict[str, _SlotInfo]]:
+        """Create expansion slots for a single scaling spec.
+
+        Slots inherit the base job's `priority` and `creation_time` (via
+        `dataclasses.replace`) so they sort alongside the base in the
+        scheduler queue and contend for resources at the same urgency.
+
+        Returns:
+            Tuple of (slot_metadata, slot_info) dicts for the new slots.
+        """
+        slots = {}
+        info = {}
+        spec_name = spec.name or DEFAULT_SCALING_SPEC_NAME
+        for i in range(spec.min_replicas, target):
+            slot_name = f"{job_name}--exp-{spec_name}-{i}"
+            slot_meta = dataclasses.replace(
+                metadata,
+                resources=spec.resources_per_replica,
+                topologies=(
+                    [Topology(topology=spec.topology_per_replica, replicas=1)]
+                    if spec.topology_per_replica
+                    else None
+                ),
+                scaling_specs=None,
+            )
+            slots[slot_name] = slot_meta
+            info[slot_name] = _SlotInfo(parent_job=job_name, name=spec_name)
+        return slots, info
+
+    @staticmethod
+    def _get_expansion_target(
+        job_name: str, spec: ScalingSpec, job_state_metadata: dict[str, JobStateMetadata]
+    ) -> int:
+        """Determine how many replicas to expand to for a given spec."""
+        # Read requested_replicas dict from state metadata (written by runner).
+        # If not present, default to min_replicas (no expansion).
+        desired_replicas = job_state_metadata.get(job_name, {}).get(DESIRED_REPLICAS_KEY, {})
+        requested = desired_replicas.get(spec.name or DEFAULT_SCALING_SPEC_NAME, spec.min_replicas)
+        return min(int(requested), spec.max_replicas)
+
+    @classmethod
+    def _collapse_expansion_verdicts(
+        cls,
+        results: BaseScheduler.ScheduleResults,
+        slot_info: dict[str, _SlotInfo],
+        original_metadata: dict[str, JobMetadata],
+    ) -> BaseScheduler.ScheduleResults:
+        """Collapse expansion slot verdicts back into parent job verdicts.
+
+        Iterates over all verdicts. For expansion slots, aggregates their
+        results (count + topology) directly into the parent verdict.
+        Non-slot verdicts pass through unchanged.
+
+        Every elastic job (one with `scaling_specs`) gets `granted_replicas`
+        initialized to its per-spec `min_replicas` so the value is always
+        present in the verdict — even when desired==min (no expansion slots
+        created) or when no slots were admitted. This lets downstream
+        consumers (e.g. ReplicaManager) reliably observe the granted count
+        on every cycle and unwind scale-ups.
+        """
+        collapsed_verdicts = {}
+
+        # Pre-pass: initialize granted_replicas on every elastic parent.
+        for job_name, metadata in original_metadata.items():
+            if not metadata.scaling_specs:
+                continue
+            verdict = results.job_verdicts.get(job_name)
+            if not verdict:
+                continue
+            verdict.metadata[GRANTED_REPLICAS_KEY] = {
+                (spec.name or DEFAULT_SCALING_SPEC_NAME): spec.min_replicas
+                for spec in metadata.scaling_specs
+            }
+
+        for job_name, verdict in results.job_verdicts.items():
+            # Non-expansion-slot jobs (regular jobs and elastic parents) pass
+            # through to the collapsed verdicts unchanged.
+            if job_name not in slot_info:
+                collapsed_verdicts[job_name] = verdict
+                continue
+
+            # Expansion slot: aggregate into parent if both parent and slot admitted.
+            info = slot_info[job_name]
+            parent_verdict = results.job_verdicts.get(info.parent_job)
+            if not parent_verdict:
+                logging.warning(
+                    "Expansion slot %s admitted but its parent %s has no "
+                    "admitted verdict; dropping slot.",
+                    job_name,
+                    info.parent_job,
+                )
+                continue
+            if not verdict:
+                continue
+
+            # Increment granted count for this slot's spec. The base value was
+            # initialized to min_replicas in the pre-pass above.
+            granted = parent_verdict.metadata.get(GRANTED_REPLICAS_KEY, {})
+            granted[info.name] = granted.get(info.name, 0) + 1
+
+            # Merge topology assignment from slot into parent verdict.
+            topo = verdict.metadata.get("topology_assignment")
+            if topo:
+                parent_topo = parent_verdict.metadata.setdefault("topology_assignment", [])
+                parent_topo.extend(topo)
+
+        return BaseScheduler.ScheduleResults(
+            project_limits=results.project_limits,
+            project_usages=results.project_usages,
+            job_verdicts=collapsed_verdicts,
+            unused_limits=results.unused_limits,
+        )

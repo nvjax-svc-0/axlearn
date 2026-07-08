@@ -68,9 +68,10 @@ from axlearn.common.utils import (
     get_current_abstract_or_physical_mesh,
     get_recursively,
     infer_mesh_shape,
+    manual_axes_to_none,
+    maybe_shard,
     set_recursively,
     tree_paths,
-    with_sharding_constraint,
 )
 
 
@@ -402,6 +403,14 @@ class BaseGating(BaseLayer):
         """
         raise NotImplementedError(type(self))
 
+    def _emit_gate_assignment(self, gate_assignment: Tensor) -> None:
+        """Publishes ``gate_assignment`` to ``module_outputs["gate_assignment"]``.
+
+        Centralizes the capture path so every gating subclass emits identically. The
+        emit is unconditional: XLA eliminates the output when nothing downstream reads it.
+        """
+        self.add_module_output("gate_assignment", gate_assignment)
+
     @nowrap
     def dispatch(
         self,
@@ -454,7 +463,7 @@ class Top2Gating(BaseGating):
 
     The methods take gating logits, potentially sharded across tpu cores as inputs.
     We rely on sharding propagation to work universally. Dispatch and combine tensors
-    should be explicitly annotated with `utils.with_sharding_constraint` by the caller.
+    should be explicitly annotated with `utils.maybe_shard` by the caller.
 
     We perform dispatch/combine via einsum.
 
@@ -492,6 +501,27 @@ class Top2Gating(BaseGating):
         if cfg.adaptive_load_balance_loss is not None:
             self._add_child("adaptive_load_balance_loss", cfg.adaptive_load_balance_loss)
 
+    def _compute_index(self, raw_gates: Tensor, *, k: int) -> Tensor:
+        """Selects the top-k experts for each token: returns indices of shape ``[..., k]``.
+
+        Default is greedy — the argmax, then the argmax of the remaining experts (Top2 is
+        fixed top-2, so ``k`` must be 2). A subclass may override this to force a fixed
+        expert assignment; `forward` recomputes the gate weights from the current
+        `raw_gates`, so gradients still flow.
+
+        Args:
+            raw_gates: post-softmax gate values, shape ``[O, G, S, E]``.
+            k: number of experts per token (2 for Top2Gating).
+
+        Returns:
+            An ``[O, G, S, k]`` int tensor of expert indices.
+        """
+        del k  # Top2Gating is fixed top-2.
+        index_1 = jnp.argmax(raw_gates, axis=-1)
+        mask_1 = jax.nn.one_hot(index_1, raw_gates.shape[-1], dtype=self.config.mask_dtype)
+        index_2 = jnp.argmax(jnp.where(mask_1, 0.0, raw_gates), axis=-1)
+        return jnp.stack([index_1, index_2], axis=-1)
+
     # pylint: disable-next=too-many-statements
     def forward(self, logits: Tensor) -> NestedTensor:
         """Please see comments of BaseGating.forward."""
@@ -510,18 +540,19 @@ class Top2Gating(BaseGating):
             num_experts=cfg.num_experts,
         )
 
-        # top-1 index: OGS tensor.
-        index_1 = jnp.argmax(raw_gates, axis=-1)
-        # OGSE tensor.
+        # Expert selection (overridable). Default is greedy top-1 then top-2; a subclass
+        # may override `_compute_index` to force a fixed expert assignment. gate_assignment
+        # is an OGSK (K=2) tensor; index_1/index_2 are OGS.
+        gate_assignment = self._compute_index(raw_gates, k=2)
+        index_1, index_2 = gate_assignment[..., 0], gate_assignment[..., 1]
+        # OGSE tensors.
         mask_1 = jax.nn.one_hot(index_1, raw_gates.shape[-1], dtype=cfg.mask_dtype)
+        # Mask out the top-1 slot so gate_2 doesn't double-count when index_1 == index_2
+        # (possible when an override forces the same expert into both slots).
+        gates_without_top_1 = jnp.where(mask_1, 0.0, raw_gates)
+        mask_2 = jax.nn.one_hot(index_2, raw_gates.shape[-1], dtype=cfg.mask_dtype)
 
         gate_1 = jnp.einsum("ogse,ogse->ogs", raw_gates, mask_1.astype(raw_gates.dtype))
-        gates_without_top_1 = jnp.where(mask_1, 0.0, raw_gates)
-
-        # Greedily pick the 2nd expert.
-        index_2 = jnp.argmax(gates_without_top_1, axis=-1)
-
-        mask_2 = jax.nn.one_hot(index_2, cfg.num_experts, dtype=cfg.mask_dtype)
         gate_2 = jnp.einsum(
             "ogse,ogse->ogs", gates_without_top_1, mask_2.astype(gates_without_top_1.dtype)
         )
@@ -631,6 +662,9 @@ class Top2Gating(BaseGating):
             )
             self.add_summary("load_balance_loss", aux_loss)
 
+        gate_assignment = jnp.stack([index_1, index_2], axis=-1)
+        self._emit_gate_assignment(gate_assignment)
+
         return self.Output(
             combine_tensor=combine_tensor,
             dispatch_tensor=dispatch_tensor,
@@ -662,7 +696,7 @@ class Top2Gating(BaseGating):
         """
         del combine_tensor  # Unused in einsum-based dispatch
         dispatch_tensor = dispatch_tensor.astype(dtype)
-        dispatch_tensor = with_sharding_constraint(dispatch_tensor, partition_spec)
+        dispatch_tensor = maybe_shard(dispatch_tensor, partition_spec)
         return jnp.einsum("ogsec,ogsm->oegcm", dispatch_tensor, inputs)
 
     @nowrap
@@ -686,7 +720,7 @@ class Top2Gating(BaseGating):
             A tensor with shape [..., G, S, M].
         """
         combine_tensor = combine_tensor.astype(dtype)
-        combine_tensor = with_sharding_constraint(combine_tensor, partition_spec)
+        combine_tensor = maybe_shard(combine_tensor, partition_spec)
         return jnp.einsum("ogecm,ogsec->ogsm", inputs, combine_tensor)
 
 
@@ -768,6 +802,16 @@ class TopKGating(BaseGating):
         gate_assignment = self._remat_name(gate_assignment, "gate_assignment")
 
         return gate_weights, gate_assignment
+
+    def _compute_index(self, raw_gates: Tensor, *, k: int) -> Tensor:
+        """Selects the routed experts: returns expert indices of shape ``[..., k]``.
+
+        Default is the natural top-k (`_top_k`, which uses a configured `topk_fn`). A
+        subclass may override this to force a fixed expert assignment; `forward` recomputes
+        the gate weights from the current `raw_gates` (``take_along_axis``) so gradients
+        still flow through the logits.
+        """
+        return self._top_k(raw_gates, k=k)[1]
 
     def _score(self, logits: Tensor, axis: int = -1) -> Tensor:
         """Computes scores from logits using configured score_fn or default softmax."""
@@ -891,9 +935,13 @@ class TopKGating(BaseGating):
         # Get the expert capacity.
         expert_capacity = self._get_expert_capacity(group_size=logits.shape[-2])
 
-        # Select top-k experts for each token using configurable top-k function.
-        # gate_weights: [O, G, S, K], gate_assignment: [O, G, S, K]
-        gate_weights, gate_assignment = self._top_k(raw_gates, k=num_experts_per_token)
+        # Select top-k experts for each token (overridable; default = `_top_k`), then
+        # recompute the gate weights from the current logits so gradients flow through them.
+        # gate_assignment: [O, G, S, K], gate_weights: [O, G, S, K]
+        gate_assignment = self._compute_index(raw_gates, k=num_experts_per_token)
+        gate_weights = jnp.take_along_axis(raw_gates, gate_assignment, axis=-1)
+        # Preserve the [O, G, S, K] shape for the Output before downstream reshapes.
+        original_gate_assignment = gate_assignment
 
         # Get the expert load balance loss.
         # This considers the load balance of all the top-k selected experts.
@@ -989,6 +1037,8 @@ class TopKGating(BaseGating):
             load_balance_loss *= self.adaptive_load_balance_loss(over_capacity_ratio)
             self.add_summary("load_balance_loss", load_balance_loss)
 
+        self._emit_gate_assignment(original_gate_assignment)
+
         return self.Output(
             combine_tensor=combine_tensor,
             dispatch_tensor=dispatch_tensor,
@@ -1020,7 +1070,7 @@ class TopKGating(BaseGating):
         """
         del combine_tensor  # Unused in einsum-based dispatch
         dispatch_tensor = dispatch_tensor.astype(dtype)
-        dispatch_tensor = with_sharding_constraint(dispatch_tensor, partition_spec)
+        dispatch_tensor = maybe_shard(dispatch_tensor, partition_spec)
         return jnp.einsum("ogsec,ogsm->oegcm", dispatch_tensor, inputs)
 
     @nowrap
@@ -1044,7 +1094,7 @@ class TopKGating(BaseGating):
             A tensor with shape [..., G, S, M].
         """
         combine_tensor = combine_tensor.astype(dtype)
-        combine_tensor = with_sharding_constraint(combine_tensor, partition_spec)
+        combine_tensor = maybe_shard(combine_tensor, partition_spec)
         return jnp.einsum("ogecm,ogsec->ogsm", inputs, combine_tensor)
 
 
@@ -1151,8 +1201,11 @@ class TopKDropFreeGating(TopKGating):
         # [B, S, E]
         raw_gates = self._score(logits, axis=-1)  # along E dim if needed.
 
+        # Configurable top-K selection (overridable; default = `_top_k`), then recompute
+        # the gate weights from the current logits so gradients flow through them.
         # [B, S, K], [B, S, K]
-        gate_weights, gate_assignment = self._top_k(raw_gates, k=cfg.num_experts_per_token)
+        gate_assignment = self._compute_index(raw_gates, k=cfg.num_experts_per_token)
+        gate_weights = jnp.take_along_axis(raw_gates, gate_assignment, axis=-1)
 
         # Get the expert load balance loss.
         # This considers the load balance of all the top-k selected experts.
@@ -1176,6 +1229,7 @@ class TopKDropFreeGating(TopKGating):
         # Renormalize the gates of the selected expert.
         # [B, S, K]
         expert_weights = gate_weights / denom
+        self._emit_gate_assignment(gate_assignment)
         # [B, S, K], [B, S, K]
         return self.Output(
             gate_assignment=gate_assignment,
@@ -1269,13 +1323,19 @@ class TopKBiasGating(TopKDropFreeGating):
         logits = _cap_logits(logits, cfg.gating_logit_cap)
         B, S, E = logits.shape  # pylint: disable=invalid-name
 
+        raw_gates = self._score(logits, axis=-1)
+
         if cfg.num_group_of_experts == 1 and cfg.topk_group == 1:
-            # Simple routing without group logic.
+            # Simple routing on the unreshaped [B, S, E] scores. Selection is overridable
+            # (default = `_top_k`, which also runs the aux-loss-free gating-bias update in
+            # training). A subclass that overrides `_compute_index` to force the routing
+            # therefore also skips the bias update — the bias adapts load only for natural
+            # routing. Such a subclass must use simple routing; group routing below is
+            # natural-only.
             router_z_loss = _router_z_loss(logits)
             self.add_summary("router_z_loss", router_z_loss)
-
-            raw_gates = self._score(logits, axis=-1)
-            gate_weights, gate_assignment = self._top_k(raw_gates, k=cfg.num_experts_per_token)
+            gate_assignment = self._compute_index(raw_gates, k=cfg.num_experts_per_token)
+            gate_weights = jnp.take_along_axis(raw_gates, gate_assignment, axis=-1)
             load_balance_loss = self._load_balance_loss(
                 raw_gates=raw_gates,
                 gate_assignment=gate_assignment,
@@ -1294,6 +1354,7 @@ class TopKBiasGating(TopKDropFreeGating):
             expert_weights = gate_weights / denom
             if cfg.routed_scaling_factor != 1:
                 expert_weights *= cfg.routed_scaling_factor
+            self._emit_gate_assignment(gate_assignment)
             return self.Output(
                 gate_assignment=gate_assignment,
                 expert_weights=expert_weights,
@@ -1369,6 +1430,7 @@ class TopKBiasGating(TopKDropFreeGating):
             expert_weights = gate_weights / denom
             if cfg.routed_scaling_factor != 1:
                 expert_weights *= cfg.routed_scaling_factor
+            self._emit_gate_assignment(gate_assignment.reshape(B, S, -1))
             return self.Output(
                 gate_assignment=gate_assignment.reshape(B, S, -1),
                 expert_weights=expert_weights.reshape(B, S, -1),
@@ -1642,7 +1704,7 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
         group_len = num_tokens // num_groups
         logging.info("Setting the effective group_size=%r", group_len)
         x = x.reshape([outer_batch, num_groups, group_len, cfg.input_dim])
-        x = with_sharding_constraint(x, cfg.dim_to_mesh_axis_map["ogsm"])
+        x = maybe_shard(x, cfg.dim_to_mesh_axis_map["ogsm"])
         logits = jnp.einsum("ogsm,me->ogse", x, self.parameters["gate_weight"])
         # Perform gating based on logits. Casting to float32 precision is usually needed for
         # stable performance.
@@ -1683,7 +1745,7 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
             partition_spec=dispatch_partition_spec,
             combine_tensor=combine_tensor_for_dispatch,
         )
-        x = with_sharding_constraint(x, cfg.dim_to_mesh_axis_map["oegcm"])
+        x = maybe_shard(x, cfg.dim_to_mesh_axis_map["oegcm"])
         x = self._wi_activation(x, dispatch_tensor)
         if cfg.structure in ["prenorm", "hybridnorm", "nonorm", "v2"]:
             x = self.dropout1(x)
@@ -1691,13 +1753,13 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
             x = self.einsum_maybe_quantized(
                 "oegch,ehm->oegcm", activation=x, kernel=self.parameters["wo_weight"]
             )
-        x = with_sharding_constraint(x, cfg.dim_to_mesh_axis_map["oegcm"])
+        x = maybe_shard(x, cfg.dim_to_mesh_axis_map["oegcm"])
 
         # Transpose from oegcm to ogecm format for combine operation.
         # TopKGating and Top2Gating both expect inputs in ogecm format.
         if cfg.gating.klass in [TopKGating, Top2Gating]:
             x = jnp.einsum("oegcm->ogecm", x)
-            x = with_sharding_constraint(x, cfg.dim_to_mesh_axis_map["ogecm"])
+            x = maybe_shard(x, cfg.dim_to_mesh_axis_map["ogecm"])
 
         # Support dynamic partition spec lookup for combine operation.
         if hasattr(cfg.gating.klass, "combine_tensor_shape"):
@@ -1713,7 +1775,7 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
             dtype=input_dtype,
             partition_spec=combine_partition_spec,
         )
-        x = with_sharding_constraint(x, cfg.dim_to_mesh_axis_map["ogsm"])
+        x = maybe_shard(x, cfg.dim_to_mesh_axis_map["ogsm"])
 
         # Add RMS norm summary for linear2 outputs.
         self.add_summary("rms_norm/linear2_outputs", (x**2.0).mean().astype(jnp.float32) ** 0.5)
@@ -1764,7 +1826,7 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
                         "expert_dead_neurons",
                         num_dead_units,
                     )
-                x_i = with_sharding_constraint(x_i, cfg.dim_to_mesh_axis_map["oegch"])
+                x_i = maybe_shard(x_i, cfg.dim_to_mesh_axis_map["oegch"])
                 x_i = get_activation_fn(activation)(x_i)
                 activations.append(x_i)
             assert len(activations) == 2, cfg.activation
@@ -1774,7 +1836,7 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
                 x = self.einsum_maybe_quantized(
                     "oegcm,emh->oegch", activation=x, kernel=self.parameters["wi_weight"]
                 )
-            x = with_sharding_constraint(x, cfg.dim_to_mesh_axis_map["oegch"])
+            x = maybe_shard(x, cfg.dim_to_mesh_axis_map["oegch"])
             return get_activation_fn(cfg.activation)(x)
 
 
@@ -1815,9 +1877,7 @@ def _convert_feedforward_to_moe_parameters(
         moe_weight_prefix = "wi" if m.group(1) == "1" else "wo"
         moe_weight_suffix = m.group(2)
         # Shard the dispatch tensor by 'expert'.
-        dispatch = with_sharding_constraint(
-            jnp.ones([num_experts], dtype=value.dtype), PartitionSpec("expert")
-        )
+        dispatch = maybe_shard(jnp.ones([num_experts], dtype=value.dtype), PartitionSpec("expert"))
         moe_parameters[f"{moe_weight_prefix}{moe_weight_suffix}_weight"] = jnp.einsum(
             "xy,e->exy", value, dispatch
         )
@@ -1940,9 +2000,13 @@ def convert_dense_to_moe_parameters(
     return target_parameters
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3,))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4))
 def _custom_gather(
-    x: Tensor, idx: Tensor, argsort_idx: Tensor, unique_indices: bool = True
+    x: Tensor,
+    idx: Tensor,
+    argsort_idx: Tensor,
+    unique_indices: bool = True,
+    k_outermost: bool = False,
 ) -> Tensor:
     """Equivalent to `x.at[idx].get(unique_indices=unique_indices)`, but with a gather-based
     backward pass.
@@ -1955,7 +2019,8 @@ def _custom_gather(
     1. idx is unique and len(idx) == x.shape[0], i.e. idx is a permutation. In this case, the
        backward is a gather
     2. len(unique(idx)) == x.shape[0] and each value in idx has the same number of duplicates.
-       In this case, the backward is a gather followed by a reduction on the duplicates.
+       In this case, the backward is a gather followed by a reduction on the duplicates
+       (contiguous or K-outermost/strided per `k_outermost`).
 
     If `idx` doesn't follow above cases, the behavior of this function is undefined.
 
@@ -1966,21 +2031,26 @@ def _custom_gather(
         idx: A tensor of shape [S x K], where K is the number of duplicates of each index.
         argsort_idx: A tensor of shape [S x K] that's equal to jnp.argsort(idx).
         unique_indices: True if K == 1, False otherwise.
+        k_outermost: Layout of the K duplicates of each index (only used when K > 1). False
+            (default): the K copies of index i are contiguous in argsort(idx) order (K-innermost),
+            reduced with reshape(-1, K).sum(1). True: the K copies are strided by x.shape[0] (idx
+            laid out K-outermost, i.e. flatten of [K, S]), reduced with reshape(K, -1).sum(0).
 
     Returns:
         A tensor of shape [S x K, ...]
     """
-    return _custom_gather_fwd(x, idx, argsort_idx, unique_indices)[0]
+    return _custom_gather_fwd(x, idx, argsort_idx, unique_indices, k_outermost)[0]
 
 
 def _custom_gather_fwd(
-    x: Tensor, idx: Tensor, argsort_idx: Tensor, unique_indices: bool
+    x: Tensor, idx: Tensor, argsort_idx: Tensor, unique_indices: bool, k_outermost: bool
 ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+    del k_outermost  # nondiff; used in the backward only.
     return x.at[idx].get(unique_indices=unique_indices), (argsort_idx, x)
 
 
 def _custom_gather_bwd(
-    unique_indices: bool, res: tuple[Tensor, Tensor], g: Tensor
+    unique_indices: bool, k_outermost: bool, res: tuple[Tensor, Tensor], g: Tensor
 ) -> tuple[Tensor, None, None]:
     del unique_indices
     argsort_idx, x = res
@@ -1990,7 +2060,12 @@ def _custom_gather_bwd(
     out = g.at[argsort_idx].get(unique_indices=True)
     if reduction_dim == 1:
         return out, None, None
-    out = out.reshape(-1, reduction_dim, *out.shape[1:]).sum(1)
+    if k_outermost:
+        # Duplicates of each index are strided by x.shape[0] (idx laid out K-outermost).
+        out = out.reshape(reduction_dim, -1, *out.shape[1:]).sum(0)
+    else:
+        # Duplicates of each index are contiguous.
+        out = out.reshape(-1, reduction_dim, *out.shape[1:]).sum(1)
     assert out.shape == x.shape
     return out, None, None
 
@@ -2484,7 +2559,7 @@ class TransformerFeedForwardDropFreeMoE(TransformerFeedForwardMoE):
     def _dispatch_and_combine(self, x: Tensor) -> Tensor:
         """Runs forward pass on the linear layers and dispatching and combining."""
         cfg = self.config
-        x = with_sharding_constraint(x, cfg.input_dim_to_partition_spec["bsm"])
+        x = maybe_shard(x, cfg.input_dim_to_partition_spec["bsm"])
         logits = jnp.einsum("bsm,me->bse", x.astype(jnp.float32), self.parameters["gate_weight"])
         assert logits.dtype == jnp.float32
 
@@ -2493,12 +2568,12 @@ class TransformerFeedForwardDropFreeMoE(TransformerFeedForwardMoE):
         gating = self.gating(logits, cfg.seq_load_balance_loss_weight)
         # gate_assignment: [B, S, K] where each value is in [0, E-1], representing which
         # expert to use for a token.
-        gate_assignment = with_sharding_constraint(
+        gate_assignment = maybe_shard(
             gating.gate_assignment,
             cfg.input_dim_to_partition_spec["bsm"],
         )
         # expert_weights: [B, S, K]
-        expert_weights = with_sharding_constraint(
+        expert_weights = maybe_shard(
             gating.expert_weights,
             cfg.input_dim_to_partition_spec["bsm"],
         )
@@ -2531,31 +2606,39 @@ class TransformerFeedForwardDropFreeMoE(TransformerFeedForwardMoE):
         assert cfg.dim_to_mesh_axis_map["emh"][-1] == "model"
         assert cfg.dim_to_mesh_axis_map["ehm"][-2] == "model"
 
-        emh_gather_axes = cfg.dim_to_mesh_axis_map["emh"][1]
-        ehm_gather_axes = cfg.dim_to_mesh_axis_map["ehm"][2]
-        bsm_out_spec = cfg.output_dim_to_partition_spec["bsm"]
-        bskm_out_spec = PartitionSpec(*bsm_out_spec[:2], None, bsm_out_spec[2])
+        # Drop axes flagged Manual by an enclosing shard_map; those axes can't appear in
+        # this inner shard_map's specs or `all_gather`'s `axis_name`.
+        emh_gather_axes = _drop_manual_axes(cfg.dim_to_mesh_axis_map["emh"][1])
+        ehm_gather_axes = _drop_manual_axes(cfg.dim_to_mesh_axis_map["ehm"][2])
+        bsm_out_spec = manual_axes_to_none(cfg.output_dim_to_partition_spec["bsm"])
+        # [K, B, S, M']: K unsharded (None) at the front (K-outermost combine layout).
+        kbsm_out_spec = PartitionSpec(None, *bsm_out_spec[:2], bsm_out_spec[2])
 
         mesh = thread_resources.env.physical_mesh
 
+        # `jax.jit` is required because `jax.checkpoint` below is a `closed_call` that
+        # `shard_map` can't evaluate eagerly. Nested under an outer `jit` (production case)
+        # this collapses at trace time and is free.
+        @jax.jit
         @partial(
             jax.shard_map,
             mesh=get_current_abstract_or_physical_mesh(),
             in_specs=(
-                cfg.input_dim_to_partition_spec["bsm"],
-                cfg.input_dim_to_partition_spec["bsm"],
-                cfg.dim_to_mesh_axis_map["emh"],
-                cfg.dim_to_mesh_axis_map["emh"],
-                cfg.dim_to_mesh_axis_map["ehm"],
+                manual_axes_to_none(cfg.input_dim_to_partition_spec["bsm"]),
+                manual_axes_to_none(cfg.input_dim_to_partition_spec["bsm"]),
+                manual_axes_to_none(cfg.dim_to_mesh_axis_map["emh"]),
+                manual_axes_to_none(cfg.dim_to_mesh_axis_map["emh"]),
+                manual_axes_to_none(cfg.dim_to_mesh_axis_map["ehm"]),
             ),
             out_specs=(
-                bskm_out_spec,
+                kbsm_out_spec,
                 *self._additional_shmap_output_sharding(mesh),
             ),
             # Disables a checking pass which jax can't apply when there's a triton | pallas
             # call in the body.
             check_vma=False,
         )
+        @partial(jax.checkpoint, prevent_cse=False)
         def wrapper(
             x: Tensor,
             gate_assignment: Tensor,
@@ -2581,95 +2664,72 @@ class TransformerFeedForwardDropFreeMoE(TransformerFeedForwardMoE):
                 - A tensor of shape [G=B', S', K, M'].
                 - ... optional series of tensors from `_dispatch_hook()[2]`.
             """
-            logging.info("Setting the effective group_size=%r", x.shape[0])
             B, S, M = x.shape  # pylint: disable=invalid-name
+            logging.info("Setting the effective group_size=%r", B)
 
-            @jax.jit
-            @partial(jax.checkpoint, prevent_cse=False)
-            def _gather_and_compute(
-                x: Tensor,
-                gate_assignment: Tensor,
-                wi_0_sharded: Tensor,
-                wi_1_sharded: Tensor,
-                wo_sharded: Tensor,
-            ) -> tuple[Tensor, ...]:
-                # Explicitly all-gather expert weights along fsdp inside the
-                # checkpoint scope. Backward will recompute this gather rather
-                # than saving the gathered tensor.
-                if emh_gather_axes is not None:
-                    wi_0 = jax.lax.all_gather(wi_0_sharded, emh_gather_axes, axis=1, tiled=True)
-                    wi_1 = jax.lax.all_gather(wi_1_sharded, emh_gather_axes, axis=1, tiled=True)
-                else:
-                    wi_0 = wi_0_sharded
-                    wi_1 = wi_1_sharded
-                if ehm_gather_axes is not None:
-                    wo = jax.lax.all_gather(wo_sharded, ehm_gather_axes, axis=2, tiled=True)
-                else:
-                    wo = wo_sharded
+            if emh_gather_axes:
+                wi_0 = jax.lax.all_gather(wi_0_sharded, emh_gather_axes, axis=1, tiled=True)
+                wi_1 = jax.lax.all_gather(wi_1_sharded, emh_gather_axes, axis=1, tiled=True)
+            else:
+                wi_0, wi_1 = wi_0_sharded, wi_1_sharded
+            if ehm_gather_axes:
+                wo = jax.lax.all_gather(wo_sharded, ehm_gather_axes, axis=2, tiled=True)
+            else:
+                wo = wo_sharded
 
-                # [B' x S' x K]
-                gate_assignment = gate_assignment.reshape((-1))
-                # x[sorted_indices[:, i]] for i in range(S * K) represents tokens sorted
-                # by which experts they are assigned to.
-                # [B' x S' x K]
-                sorted_indices = jnp.argsort(gate_assignment)
-                token_indices = sorted_indices // num_experts_per_token
-                # Dispatch the tokens.
-                combine_indices = jnp.argsort(sorted_indices)
-                # [B' x S' x K, M]
-                sorted_inputs = _custom_gather(
-                    x.reshape(-1, M), token_indices, combine_indices, unique_indices=False
-                )
-                tokens_per_expert = jnp.bincount(gate_assignment, length=cfg.num_experts)
-
-                sorted_inputs, tokens_per_expert, additional_outputs, residuals = (
-                    self._dispatch_hook(
-                        sorted_inputs=sorted_inputs,
-                        tokens_per_expert=tokens_per_expert,
-                    )
-                )
-
-                # [B' x S' x K, H']
-                activation_0 = self._padded_gmm(sorted_inputs, wi_0, tokens_per_expert)
-                activation_0 = get_activation_fn(cfg.activation[0])(activation_0)
-
-                activation_1 = self._padded_gmm(sorted_inputs, wi_1, tokens_per_expert)
-                activation_1 = get_activation_fn(cfg.activation[1])(activation_1)
-
-                intermediate = activation_0 * activation_1
-
-                if cfg.structure in ["prenorm", "hybridnorm", "nonorm", "v2"]:
-                    intermediate = self.dropout1(intermediate)
-
-                # [B' x S x K, M]
-                sorted_output = self._padded_gmm(intermediate, wo, tokens_per_expert)
-                if thread_resources.env.physical_mesh.shape["model"] > 1:
-                    # If output is partitioned across "model", we need to reduce-scatter. Otherwise,
-                    # we do an allreduce.
-                    spec = cfg.output_dim_to_partition_spec["bsm"][2]
-                    if spec and "model" in spec:
-                        sorted_output = jax.lax.psum_scatter(
-                            sorted_output, "model", scatter_dimension=1, tiled=True
-                        )
-                    else:
-                        sorted_output = jax.lax.psum(sorted_output, "model")
-                # [B' x S' x K, M']
-                sorted_output = self._combine_hook(sorted_output=sorted_output, residuals=residuals)
-                # Gather the tokens to their original positions.
-                unsorted_output = _custom_gather(sorted_output, combine_indices, sorted_indices)
-                # [B', S', K, M']
-                output = unsorted_output.reshape(
-                    B, S, num_experts_per_token, unsorted_output.shape[-1]
-                )
-                return output, *additional_outputs
-
-            return _gather_and_compute(
-                x,
-                gate_assignment,
-                wi_0_sharded,
-                wi_1_sharded,
-                wo_sharded,
+            # Sort tokens by expert assignment. Flatten K-outermost (k, b, s) so the un-sorted
+            # output is naturally [K, B', S', M'] and the combine reduces over K as a block-add
+            # (T(8,128)) instead of a [B,S,K,M'] axis=-2 reduction (T(2,128) re-layout). Each
+            # token's K entries are strided by B'*S' here, so the dispatch gather's backward
+            # uses k_outermost=True.
+            gate_assignment = jnp.transpose(gate_assignment, (2, 0, 1)).reshape((-1))  # [K*B'*S']
+            sorted_indices = jnp.argsort(gate_assignment)
+            token_indices = sorted_indices % (B * S)
+            combine_indices = jnp.argsort(sorted_indices)
+            # [K x B' x S', M]
+            sorted_inputs = _custom_gather(
+                x.reshape(-1, M),
+                token_indices,
+                combine_indices,
+                unique_indices=False,
+                k_outermost=True,
             )
+            tokens_per_expert = jnp.bincount(gate_assignment, length=cfg.num_experts)
+
+            sorted_inputs, tokens_per_expert, additional_outputs, residuals = self._dispatch_hook(
+                sorted_inputs=sorted_inputs,
+                tokens_per_expert=tokens_per_expert,
+            )
+
+            # [B' x S' x K, H']
+            activation_0 = get_activation_fn(cfg.activation[0])(
+                self._padded_gmm(sorted_inputs, wi_0, tokens_per_expert)
+            )
+            activation_1 = get_activation_fn(cfg.activation[1])(
+                self._padded_gmm(sorted_inputs, wi_1, tokens_per_expert)
+            )
+            intermediate = activation_0 * activation_1
+
+            if cfg.structure in ["prenorm", "hybridnorm", "nonorm", "v2"]:
+                intermediate = self.dropout1(intermediate)
+
+            # [B' x S x K, M]
+            sorted_output = self._padded_gmm(intermediate, wo, tokens_per_expert)
+            if thread_resources.env.physical_mesh.shape["model"] > 1:
+                # Reduce-scatter if output is "model"-sharded; otherwise allreduce.
+                spec = cfg.output_dim_to_partition_spec["bsm"][2]
+                if spec and "model" in spec:
+                    sorted_output = jax.lax.psum_scatter(
+                        sorted_output, "model", scatter_dimension=1, tiled=True
+                    )
+                else:
+                    sorted_output = jax.lax.psum(sorted_output, "model")
+            # [B' x S' x K, M']
+            sorted_output = self._combine_hook(sorted_output=sorted_output, residuals=residuals)
+            unsorted_output = _custom_gather(sorted_output, combine_indices, sorted_indices)
+            # [K, B', S', M'] (K-outermost)
+            output = unsorted_output.reshape(num_experts_per_token, B, S, unsorted_output.shape[-1])
+            return output, *additional_outputs
 
         out, *additional_outputs = wrapper(
             x,
@@ -2680,14 +2740,14 @@ class TransformerFeedForwardDropFreeMoE(TransformerFeedForwardMoE):
         )
         self._additional_shmap_output_hook(additional_outputs)
 
-        # Apply expert weights outside shard_map to avoid passing extra tensor
-        # through the shard_map boundary and recomputing it in backward.
-        # out: [B, S, K, M'], expert_weights: [B, S, K]
-        out *= expert_weights[..., None]
+        # Apply expert weights outside shard_map: keeps the extra [B, S, K] tensor off the
+        # boundary (would otherwise be saved as a residual and recomputed in backward).
+        # Fuse the weighted reduce-over-K: out [K,B,S,M'] x expert_weights [B,S,K] -> [B,S,M'],
+        # a block-add over the outer K (T(8,128)), no explicit expert_weights transpose.
         assert expert_weights.dtype == jnp.float32
-        assert out.dtype == jnp.float32
-        # [B, S, M']
-        out = jnp.sum(out, axis=-2).astype(x.dtype)
+        # out (gmm output) may be bf16; upcast so the reduce accumulates in float32, not bf16
+        # (the old `out *= expert_weights[..., None]; sum(axis=-2)` promoted out to f32). [B, S, M']
+        out = jnp.einsum("kbsm,bsk->bsm", out.astype(jnp.float32), expert_weights).astype(x.dtype)
         return out
 
 
@@ -2805,3 +2865,23 @@ class V6eGMMTilingModifier(ConfigModifier):
 
         cfg.visit(visit_fn=visit_fn, enter_fn=enter_fn)
         return cfg
+
+
+def _drop_manual_axes(axes: Union[str, tuple, None]) -> Union[str, tuple, None]:
+    """Drops Manual mesh axes from an axis-name collection for `jax.lax.all_gather`'s
+    `axis_name` (which rejects both Manual axes and `UNCONSTRAINED`).
+
+    Manual axes come from an enclosing `shard_map`; this helper looks them up via
+    `get_abstract_mesh()`. Outside `shard_map`, returns the input unchanged.
+    """
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    if abstract_mesh.empty:
+        return axes
+    auto_axes = set(abstract_mesh.auto_axes)
+    if axes is None:
+        return None
+    if isinstance(axes, str):
+        return axes if axes in auto_axes else None
+    if isinstance(axes, tuple):
+        return tuple(a for a in axes if a in auto_axes)
+    raise TypeError(f"_drop_manual_axes: unsupported type {type(axes)}")

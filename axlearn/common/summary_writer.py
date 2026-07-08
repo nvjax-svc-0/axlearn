@@ -89,6 +89,19 @@ class BaseWriter(Module):
             step: Training step.
         """
 
+    def log_average_step_time(self, step: int, step_times: Sequence[float]):
+        """Log the average step time.
+
+        The default implementation writes the average over all step_times every 100 steps.
+        Derived writers may override to use their own interval and window.
+
+        Args:
+            step: The current step.
+            step_times: A buffer of recent step times (most recent last), of length <= 100.
+        """
+        if step % 100 == 0 and step_times:
+            self(step, {"average_step_time": _average_step_time(step_times, len(step_times))})
+
     # We adapt the args and kwargs from base Module to arguments specific to summary writer,
     # and drop the method argument since the caller does not decide which method to call.
     # pylint: disable=arguments-differ
@@ -136,6 +149,10 @@ class CompositeWriter(BaseWriter):
         writer: BaseWriter
         for writer in self._writers:
             writer(step, values)
+
+    def log_average_step_time(self, step: int, step_times: Sequence[float]):
+        for writer in self._writers:
+            writer.log_average_step_time(step, step_times)
 
     def log_checkpoint(
         self,
@@ -275,29 +292,28 @@ class SummaryWriter(BaseWriter):
             n_steps = cfg.write_every_n_steps_map.get(kind, cfg.write_every_n_steps)
             return step % n_steps == 0
 
+    def log_average_step_time(self, step: int, step_times: Sequence[float]):
+        cfg = self.config
+        if step % cfg.write_every_n_steps != 0:
+            return
+        average = _average_step_time(step_times, cfg.write_every_n_steps)
+        if average is not None:
+            self(step, {"average_step_time": average})
+
     def __call__(self, step: int, values: dict[str, Any]):
         cfg = self.config
         if step % cfg.write_every_n_steps != 0:
             return
 
+        prepared, paths = _prepare_for_d2h(values)
+
         with self.summary_writer.as_default(step=step):
 
-            def write(path: str, value: jax.Array):
-                if isinstance(value, Summary):
-                    raw_value = value.value()
-                else:
-                    raw_value = value
-
-                self.vlog(3, "SummaryWriter %s: %s=%s", self.path(), path, raw_value)
-
-                if isinstance(raw_value, Tensor) and not raw_value.is_fully_replicated:
-                    logging.warning(
-                        "SummaryWriter: %s: %s is not fully replicated", path, raw_value
-                    )
+            def write(path: str, raw_value, value):
+                if raw_value is None:
                     return
 
-                if isinstance(raw_value, jax.Array):
-                    raw_value = np.asarray(raw_value)
+                self.vlog(3, "SummaryWriter %s: %s=%s", self.path(), path, raw_value)
 
                 if _match_summary_type("Image", value=value, raw_value=raw_value):
                     if self._time_to_write(step, "Image"):
@@ -338,12 +354,7 @@ class SummaryWriter(BaseWriter):
                     raw_value.__class__,
                 )
 
-            def is_leaf(x):
-                return isinstance(x, Summary)
-
-            paths = tree_paths(values, separator="/", is_leaf=is_leaf)
-            jax.tree.map(write, paths, values, is_leaf=is_leaf)
-            self.summary_writer.flush()
+            jax.tree.map(write, paths, prepared, values, is_leaf=_is_summary_leaf)
 
 
 class WandBWriter(BaseWriter):
@@ -461,10 +472,26 @@ class WandBWriter(BaseWriter):
             wandb.Settings(**cfg.wandb_settings_kwargs) if cfg.wandb_settings_kwargs else None
         )
 
+        tags = cfg.tags or None
+        if tags:
+            _WANDB_MAX_TAG_LEN = 64  # See `wandb.Settings.validate_run_tags`
+            truncated = []
+            for tag in tags:
+                if len(tag) > _WANDB_MAX_TAG_LEN:
+                    logging.warning(
+                        "WandB tag %r is %d characters (max %d); truncating.",
+                        tag,
+                        len(tag),
+                        _WANDB_MAX_TAG_LEN,
+                    )
+                    tag = tag[:_WANDB_MAX_TAG_LEN]
+                truncated.append(tag)
+            tags = truncated
+
         wandb.init(
             id=exp_id,
             name=cfg.exp_name,
-            tags=cfg.tags if cfg.tags else None,
+            tags=tags,
             project=cfg.project,
             entity=cfg.entity,
             notes=cfg.notes,
@@ -516,24 +543,27 @@ class WandBWriter(BaseWriter):
             n_steps = cfg.write_every_n_steps_map.get(kind, cfg.write_every_n_steps)
             return step % n_steps == 0
 
+    def log_average_step_time(self, step: int, step_times: Sequence[float]):
+        cfg = self.config
+        if step % cfg.write_every_n_steps != 0:
+            return
+        average = _average_step_time(step_times, cfg.write_every_n_steps)
+        if average is not None:
+            self(step, {"average_step_time": average})
+
     def __call__(self, step: int, values: dict[str, Any]) -> None:
         """Convert nested summary values to wandb acceptable format and upload run data."""
         cfg = self.config
         if step % cfg.write_every_n_steps != 0:
             return
 
-        def convert(path: str, value: Any):
-            if isinstance(value, Summary):
-                raw_value = value.value()
-            else:
-                raw_value = value
+        prepared, paths = _prepare_for_d2h(values)
 
+        def convert(path: str, raw_value, value: Any):
             self.vlog(3, "WandbWriter %s: %s=%s", self.path(), path, raw_value)
 
-            # Ensure all arrays are cast to numpy. Wandb will crash if jax.Array is present.
-            if isinstance(raw_value, jax.Array):
-                # It internally call jax.device_get() to copy TPU/GPU tensor to CPU.
-                raw_value = np.asarray(raw_value)
+            if raw_value is None:
+                return
 
             if _match_summary_type("Image", value=value, raw_value=raw_value):
                 if self._time_to_write(step, "Image"):
@@ -542,7 +572,6 @@ class WandBWriter(BaseWriter):
 
             if _match_summary_type("Audio", value=value, raw_value=raw_value):
                 if self._time_to_write(step, "Audio"):
-                    # W&B calls soundfile.write and saves a wav file with int16 dtype.
                     sample_rate = value.sample_rate
                     assert raw_value.ndim == 2, raw_value.shape
                     assert np.issubdtype(raw_value.dtype, np.floating), raw_value.dtype
@@ -570,11 +599,7 @@ class WandBWriter(BaseWriter):
                 'WandBWriter: Does not know how to log "%s" (%s).', path, raw_value.__class__
             )
 
-        def is_leaf(x):
-            return isinstance(x, Summary)
-
-        paths = tree_paths(values, separator="/", is_leaf=is_leaf)
-        values = jax.tree.map(convert, paths, values, is_leaf=is_leaf)
+        values = jax.tree.map(convert, paths, prepared, values, is_leaf=_is_summary_leaf)
 
         # Flatten nested dicts and join the keys with "/"
         flat_paths_and_values, _ = jax.tree_util.tree_flatten_with_path(values)
@@ -590,11 +615,56 @@ class WandBWriter(BaseWriter):
         # and will create the proper nesting if we replace `.` with `/`.
         values = {k.replace(".", "/"): v for k, v in values.items() if v is not None}
 
-        # Jax SPMD execution model requires that all JAX collective API calls (such as
-        # `jax.device_get()`) be invoked simultaneously on all processes. OTOH, reporting to
-        # W&B should be performed only on process 0 to avoid duplicated reports.
+        # Reporting to W&B should be performed only on process 0 to avoid duplicated reports.
         @processor_zero_only
         def _upload(values, step):
             wandb.log(values, step=step)
 
         _upload(values, step)
+
+
+def _is_summary_leaf(x) -> bool:
+    """Pytree is_leaf predicate that treats Summary objects as leaves."""
+    return isinstance(x, Summary)
+
+
+def _prepare_for_d2h(values: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Unwrap Summary objects and transfer all values to host in a single batch.
+
+    Returns:
+        A tuple of (prepared_np, paths) where prepared_np contains numpy values
+        (with None for non-replicated tensors) and paths contains the corresponding
+        summary path strings.
+    """
+
+    def _unwrap(value):
+        raw = value.value() if isinstance(value, Summary) else value
+        if isinstance(raw, Tensor) and not raw.is_fully_replicated:
+            logging.warning("SummaryWriter: %s is not fully replicated", raw)
+            return None
+        return raw
+
+    prepared = jax.tree.map(_unwrap, values, is_leaf=_is_summary_leaf)
+    # Critical: batch all device-to-host transfers in one call. Sequential per-value
+    # np.asarray() is orders of magnitude slower (90s vs <1s for ~1750 scalar entries).
+    prepared = jax.device_get(prepared)
+    paths = tree_paths(values, separator="/", is_leaf=_is_summary_leaf)
+    return prepared, paths
+
+
+def _average_step_time(step_times: Sequence[float], window: int) -> Optional[float]:
+    """Computes the average step time over the last `window` entries.
+
+    Args:
+        step_times: A buffer of recent step times (most recent last).
+        window: Number of most recent entries to average over.
+
+    Returns:
+        The average, or None if the average step time cannot be computed.
+    """
+    if not step_times:
+        return None
+    n = min(window, len(step_times))
+    if n <= 0:
+        return None
+    return sum(list(step_times)[-n:]) / n

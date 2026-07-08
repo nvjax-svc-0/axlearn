@@ -9,6 +9,7 @@ import os.path
 import signal
 import threading
 import time
+from collections import deque
 from collections.abc import Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
 
@@ -74,6 +75,14 @@ class TrainerState(NamedTuple):
     prng_key: Union[Tensor, TensorSpec, jax.sharding.NamedSharding]
     model: Union[NestedTensor, Nested[TensorSpec], Nested[jax.sharding.NamedSharding]]
     learner: Union[NestedTensor, Nested[TensorSpec], Nested[jax.sharding.NamedSharding]]
+
+
+class UndefinedLossException(Exception):
+    """
+    Raised when loss becomes undefined.
+    """
+
+    pass
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -618,8 +627,8 @@ class SpmdTrainer(Module):
 
             with self.checkpointer:
                 logging.info("Starting loop...")
-                start_time = time.perf_counter()
-                num_steps = 0
+                step_times: deque[float] = deque(maxlen=100)
+                prev_time = time.perf_counter()
                 output = None
                 stop_trace_step = None
 
@@ -651,14 +660,13 @@ class SpmdTrainer(Module):
                             ),
                         )
                         self.vlog(3, "Done step %s", self.step)
-                        num_steps += 1
-                        if num_steps % 100 == 0:
-                            now = time.perf_counter()
-                            average_step_time = (now - start_time) / num_steps
+                        now = time.perf_counter()
+                        step_times.append(now - prev_time)
+                        prev_time = now
+                        self.summary_writer.log_average_step_time(self.step, step_times)
+                        if self.step % 100 == 0:
+                            average_step_time = sum(step_times) / len(step_times)
                             self._step_log("Average step time: %s seconds", average_step_time)
-                            self.summary_writer(self.step, {"average_step_time": average_step_time})
-                            num_steps = 0
-                            start_time = now
                         if self.step >= cfg.max_step:
                             self._step_log("Reached max_step=%s. Stopping", cfg.max_step)
                             break
@@ -1152,11 +1160,16 @@ class SpmdTrainer(Module):
 
         n = self._config.log_every_n_steps or 100
         if self.step % n == 0 or 0 <= self.step <= 5:
+            loss = outputs["loss"]
             self._step_log(
                 "loss=%s aux=%s",
-                outputs["loss"],
+                loss,
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
+            if not self.learner.handles_undefined_loss() and not jnp.isfinite(loss):
+                raise UndefinedLossException(
+                    f"Detected undefined loss at step {self.step} with value {loss}"
+                )
 
         self.summary_writer(self.step, {"loss": outputs["loss"], **outputs["summaries"]})
         # Aggregate summaries across evalers.
@@ -1466,15 +1479,22 @@ def aot_model_analysis(compiled: jax.stages.Compiled) -> str:
     if mem_stats is not None:
         analysis_results += "======= Memory Analysis ==================================\n"
         try:
+            # XLA may alias output buffers onto input buffers when
+            # ``donate_argnums`` is used (typical for jit'ed training steps);
+            # subtract the aliased bytes so the reported total reflects the
+            # actual peak HBM, not the double-counted argument + output sum.
+            aliased_bytes = mem_stats.alias_size_in_bytes
             total_hbm = (
                 mem_stats.argument_size_in_bytes
                 + mem_stats.output_size_in_bytes
+                - aliased_bytes
                 + mem_stats.temp_size_in_bytes
                 + mem_stats.generated_code_size_in_bytes
             )
             analysis_results += (
                 f"Input memory: {mb_or_gb(mem_stats.argument_size_in_bytes)}\n"
                 + f"Output memory: {mb_or_gb(mem_stats.output_size_in_bytes)}\n"
+                + f"Aliased input/output memory: {mb_or_gb(aliased_bytes)}\n"
                 + f"Temp memory: {mb_or_gb(mem_stats.temp_size_in_bytes)}\n"
                 + f"Code memory: {mb_or_gb(mem_stats.generated_code_size_in_bytes)}\n"
                 + f"Total HBM memory: {mb_or_gb(total_hbm)}\n"

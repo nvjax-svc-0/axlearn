@@ -5,8 +5,8 @@ py_library(
     srcs = ["cleaner.py"],
     visibility = ["//visibility:public"],
     deps = [
-        ":scheduler",
         ":job_types",
+        ":scheduler",
         "//axlearn/common:config",
     ],
 )
@@ -114,10 +114,12 @@ py_library(
     deps = [
         ":cleaner",
         ":event_queue",
+        ":job_types",
         ":metrics",
         ":quota",
+        ":replica_manager",
+        ":scaling",
         ":scheduler",
-        ":job_types",
         ":uploader",
         ":utils",
         ":validator",
@@ -158,14 +160,33 @@ py_library(
 )
 
 py_library(
+    name = "replica_manager",
+    srcs = ["replica_manager.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//axlearn/common:config",
+    ],
+)
+
+py_library(
     name = "scheduler",
     srcs = ["scheduler.py"],
     visibility = ["//visibility:public"],
     deps = [
-        ":quota",
         ":job_types",
+        ":quota",
+        ":replica_manager",
         "//axlearn/common:config",
         "@axlearn_pip//absl_py",
+    ],
+)
+
+py_library(
+    name = "scaling",
+    srcs = ["scaling.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":job_types",
     ],
 )
 
@@ -200,8 +221,9 @@ py_test(
     srcs = ["bastion_test.py"],
     deps = [
         ":bastion",
-        ":scheduler_test_lib",
         ":job_types",
+        ":scaling",
+        ":scheduler_test_lib",
         "//axlearn/common:config",
         "//axlearn/common:file_system",
         "//axlearn/common:test_utils",
@@ -293,10 +315,10 @@ py_test(
     name = "scheduler_test",
     srcs = ["scheduler_test.py"],
     deps = [
+        ":job_types",
         ":quota",
         ":scheduler",
         ":scheduler_test_lib",
-        ":job_types",
         "//axlearn/common:config",
         "//axlearn/common:test_utils",
         "@axlearn_pip//absl_py",
@@ -308,9 +330,9 @@ py_library(
     testonly = True,
     srcs = ["scheduler_test.py"],
     deps = [
+        ":job_types",
         ":quota",
         ":scheduler",
-        ":job_types",
         "//axlearn/common:config",
         "//axlearn/common:test_utils",
         "@axlearn_pip//absl_py",
@@ -349,9 +371,9 @@ py_test(
     deps = [
         ":bastion",
         ":cleaner",
+        ":job_types",
         ":quota",
         ":scheduler",
-        ":job_types",
         "//axlearn/common:config",
         "@axlearn_pip//absl_py",
     ],

@@ -7,7 +7,6 @@ from typing import Callable, Optional, Protocol, Union
 
 import jax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 
 from axlearn.common import logit_modifiers
 from axlearn.common.attention import (
@@ -54,7 +53,6 @@ from axlearn.common.utils import (
     maybe_shard,
     sequence_mask,
     validate_contains_paths,
-    with_sharding_constraint,
 )
 
 
@@ -167,7 +165,7 @@ class BaseDecoder(Protocol):
             A Nested Tensor, which can be used as `cached_states` for the initial call of
             `extend_step()`.
             A Nested Tensor representing outputs for the given inputs. `output['logits']` will have
-            shape [batch, vocab_size].
+            shape [batch, 1, vocab_size] (only the last valid position's logits).
         """
 
     def extend_step(
@@ -197,7 +195,8 @@ class BaseDecoder(Protocol):
             (updated_cached_states, output), where:
             `updated_cached_states` represents the new cached states incorporating `input_ids`;
             `output` represents the output for the given input data. `output['logits']` will
-            have shape [batch, vocab_size].
+            have shape [batch, target_step_length, vocab_size]. In prefill mode only the last
+            valid position's logits are returned, i.e. [batch, 1, vocab_size].
         """
 
 
@@ -330,37 +329,28 @@ class DecodingLayer(Configurable):
         )
         prefill_len = infer_initial_time_step(prefix, pad_id=cfg.pad_token_id) + 1
 
-        # Prefill all prefix tokens in one shot.
+        # Prefill all prefix tokens in one shot. `prefill_states` returns only the last valid
+        # position's logits ([B, 1, V]), avoiding the full [B, prefill_len, V] tensor.
         init_states, init_outputs = self._decoder.prefill_states(
             time_step=prefill_len,
             input_batch={**input_batch, "input_ids": input_ids},
             cross_attention_data=cross_attention_data,
             cross_attention_logit_biases=cross_attention_logit_biases,
         )
+        # Sample the first generated token from the last prefill position's distribution ([B, 1, V]),
+        # then place it in input_ids so sample_decode treats it as part of the prompt.
         logsoftmax = log_probs_from_logits(init_outputs["logits"], logits_modifier=logits_modifier)
-
-        def _input_ids_after_prefill(input_ids, logsoftmax, first_key):
-            # Sample the first generated token from the last prefilled position's logits,
-            # then place it in input_ids so sample_decode treats it as part of the prompt.
-            batch_idx = jnp.arange(input_ids.shape[0])
-            first_gen_logits = logsoftmax[batch_idx, prefill_len - 1, :]
-            first_gen_token = jax.random.categorical(first_key, logits=first_gen_logits)
-            oh = jax.nn.one_hot(prefill_len, input_ids.shape[1], dtype=input_ids.dtype)
-            input_ids = input_ids * (1 - oh) + first_gen_token[:, None] * oh
-            return input_ids
-
         first_key, decode_key = jax.random.split(self._decoder.prng_key)
-        input_ids = _input_ids_after_prefill(input_ids, logsoftmax, first_key)
+        batch_idx = jnp.arange(input_ids.shape[0])
+        first_gen_token = jax.random.categorical(first_key, logits=logsoftmax[:, 0, :])
+        next_idx = jax.nn.one_hot(prefill_len, input_ids.shape[1], dtype=input_ids.dtype)
+        input_ids = input_ids * (1 - next_idx) + first_gen_token[:, None] * next_idx
 
-        # Compute per-token scores: init_scores[b, i] = log P(input_ids[b, i+1] | tokens 0..i).
-        def _get_init_scores(logsoftmax, input_ids):
-            indices = jnp.roll(input_ids, shift=-1)[:, :, None]
-            init_scores = jnp.squeeze(jnp.take_along_axis(logsoftmax, indices, axis=-1), axis=-1)
-            score_mask = sequence_mask(lengths=prefill_len, max_len=init_scores.shape[-1])
-            init_scores = init_scores * score_mask
-            return init_scores
-
-        init_scores = _get_init_scores(logsoftmax, input_ids)
+        # Skip prefix token_scores (unused downstream), but keep the first generated token's score
+        # at index `prefill_len - 1`; the decode loop only scores tokens from `prefill_len` onward.
+        first_gen_logp = logsoftmax[batch_idx, 0, first_gen_token]  # [B]
+        last_idx = jax.nn.one_hot(prefill_len - 1, input_ids.shape[1], dtype=logsoftmax.dtype)
+        init_scores = first_gen_logp[:, None] * last_idx
 
         return sample_decode(
             inputs=input_ids,
@@ -509,6 +499,13 @@ class Decoder(BaseLayer):
             None,
             "model",
         )
+        # Partition spec for the pre-matmul `logits_x` activation (not the final logits
+        # output, which always uses `logits_partition_spec`). Defaults to None, which reuses
+        # `logits_partition_spec`; set explicitly -- it takes precedence -- when hidden-dim
+        # sharding should differ, e.g. to match the embedding/lm_head weight's sharding.
+        hidden_state_partition_spec: Optional[
+            tuple[Union[Optional[str], tuple[Optional[str]]], ...]
+        ] = None
         # Precision dtype for logits computation.
         # if None, uses the input dtype as default for logits computation.
         logits_forward_dtype: Optional[jnp.dtype] = None
@@ -628,7 +625,10 @@ class Decoder(BaseLayer):
             )
             # Shard hidden states before the logit matmul to prevent XLA from
             # materializing the full [batch, seq, vocab] tensor.
-            logits_x = maybe_shard(logits_x, self.config.logits_partition_spec)
+            spec = self.config.hidden_state_partition_spec
+            logits_x = maybe_shard(
+                logits_x, spec if spec is not None else self.config.logits_partition_spec
+            )
             if "lm_head" in self.children:
                 logits = self.lm_head(logits_x)
             else:
@@ -638,7 +638,7 @@ class Decoder(BaseLayer):
 
         if self._output_logits_modifier is not None:
             logits = self._output_logits_modifier(logits)
-        logits = with_sharding_constraint(logits, PartitionSpec(*self.config.logits_partition_spec))
+        logits = maybe_shard(logits, self.config.logits_partition_spec)
         return logits
 
     def forward(
@@ -823,14 +823,21 @@ class Decoder(BaseLayer):
             cached_states=cached_states,
             **kwargs,
         )
-        # Logits are included here (unlike forward()) because decoding always needs them,
-        # and the tensor is small ([B, step, V]) compared to full-sequence forward ([B, T, V]).
-        outputs["logits"] = self.compute_logits(outputs)
-        if mode == ForwardMode.PREFILL:
-            self.add_module_output("prefill_hidden_states", outputs["hidden_states"])
         step_len = (
             jnp.sum(input_segment_ids != 0, axis=-1) if input_segment_ids is not None else step
         )
+        # Decoding always needs logits. For prefill, only the last valid position's distribution is
+        # needed (to sample the first token), so gather that hidden before the LM head — yielding
+        # [B, 1, V] instead of the huge [B, prefill_len, V].
+        if mode == ForwardMode.PREFILL:
+            last_idx = jnp.maximum(step_len - 1, 0)  # [B]
+            last_hidden = jnp.take_along_axis(
+                outputs["hidden_states"], last_idx[:, None, None], axis=1
+            )
+            outputs["logits"] = self.compute_logits(dict(hidden_states=last_hidden))  # [B, 1, V]
+            self.add_module_output("prefill_hidden_states", outputs["hidden_states"])
+        else:
+            outputs["logits"] = self.compute_logits(outputs)
         updated_states.update(
             # There are some non-greedy DFS/BFS and sliding attention algorithms that
             # recursively search through potentials.
